@@ -24,7 +24,7 @@ class User(Base):
     telegram_id = Column(String, unique=True)
     username = Column(String)
     first_name = Column(String)
-    message_count = Column(Integer, default=0)
+    message_count = Column(Integer, default=0)  # This default only works at DB level
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Conversation(Base):
@@ -62,7 +62,7 @@ def get_user_stats(telegram_id):
         user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
         
         if user:
-            count = user.message_count
+            count = user.message_count or 0  # Handle None case
             history = session.query(Conversation).filter_by(telegram_id=str(telegram_id)).order_by(Conversation.timestamp.desc()).limit(5).all()
             print(f"Found user with {count} messages")
             return count, history
@@ -81,8 +81,12 @@ def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
         user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
         if not user:
             print(f"Creating new user: {telegram_id}")
-            user = User(telegram_id=str(telegram_id), username=username, first_name=first_name)
+            user = User(telegram_id=str(telegram_id), username=username, first_name=first_name, message_count=0)
             session.add(user)
+        
+        # FIX: Handle None value for message_count
+        if user.message_count is None:
+            user.message_count = 0
         
         user.message_count += 1
         print(f"User message count: {user.message_count}")
