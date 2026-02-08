@@ -11,6 +11,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 
+print("="*50)
+print("BOT STARTING UP...")
+print("="*50)
+
 Base = declarative_base()
 
 class User(Base):
@@ -34,52 +38,54 @@ class Conversation(Base):
 
 # Get database URL from environment
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
-print(f"DEBUG: DATABASE_URL = {DATABASE_URL[:20]}...")  # Debug output
+print(f"DATABASE_URL: {DATABASE_URL[:30]}...")
 
 # Handle Railway's postgres:// vs postgresql://
 if DATABASE_URL.startswith('postgres://'):
     DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+    print("Converted postgres:// to postgresql://")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     """Create tables"""
-    print("DEBUG: Creating tables...")  # Debug output
+    print("Creating database tables...")
     Base.metadata.create_all(engine)
-    print("DEBUG: Tables created!")  # Debug output
+    print("Database tables created!")
 
 def get_user_stats(telegram_id):
     """Get user statistics"""
-    print(f"DEBUG: Getting stats for user {telegram_id}")  # Debug output
+    print(f"Getting stats for user: {telegram_id}")
     session = SessionLocal()
-    user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
-    
-    if user:
-        count = user.message_count
-        history = session.query(Conversation).filter_by(telegram_id=str(telegram_id)).order_by(Conversation.timestamp.desc()).limit(5).all()
+    try:
+        user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
+        
+        if user:
+            count = user.message_count
+            history = session.query(Conversation).filter_by(telegram_id=str(telegram_id)).order_by(Conversation.timestamp.desc()).limit(5).all()
+            print(f"Found user with {count} messages")
+            return count, history
+        print("User not found in database")
+        return 0, []
+    finally:
         session.close()
-        print(f"DEBUG: Found user with {count} messages")  # Debug output
-        return count, history
-    session.close()
-    print("DEBUG: User not found")  # Debug output
-    return 0, []
 
 def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
     """Save conversation to database"""
-    print(f"DEBUG: Saving conversation for user {telegram_id}")  # Debug output
+    print(f"SAVING CONVERSATION for user {telegram_id}")
     session = SessionLocal()
     
     try:
         # Update or create user
         user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
         if not user:
-            print(f"DEBUG: Creating new user {telegram_id}")  # Debug output
+            print(f"Creating new user: {telegram_id}")
             user = User(telegram_id=str(telegram_id), username=username, first_name=first_name)
             session.add(user)
         
         user.message_count += 1
-        print(f"DEBUG: User message count now {user.message_count}")  # Debug output
+        print(f"User message count: {user.message_count}")
         
         # Save conversation
         conv = Conversation(
@@ -88,28 +94,33 @@ def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
             bot_response=bot_msg
         )
         session.add(conv)
-        print("DEBUG: Conversation added, committing...")  # Debug output
+        print("Committing to database...")
         
         session.commit()
-        print("DEBUG: Saved successfully!")  # Debug output
+        print("SAVED SUCCESSFULLY!")
     except Exception as e:
-        print(f"DEBUG: Error saving: {e}")  # Debug output
+        print(f"ERROR SAVING: {e}")
         session.rollback()
+        import traceback
+        traceback.print_exc()
     finally:
         session.close()
 
-# Bot configuration - all from environment variables
+# Bot configuration
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 DEFAULT_MODEL = "gpt-3.5-turbo"
+
+print(f"TELEGRAM_TOKEN exists: {bool(TELEGRAM_TOKEN)}")
+print(f"OPENAI_API_KEY exists: {bool(OPENAI_API_KEY)}")
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 def get_openai_response(message):
     """Get response from OpenAI API"""
     if not OPENAI_API_KEY:
-        return "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+        return "OpenAI API key not configured."
     
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -130,12 +141,15 @@ def get_openai_response(message):
         response.raise_for_status()
         return response.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"Error getting AI response: {str(e)}"
+        print(f"OpenAI error: {e}")
+        return f"Error: {str(e)}"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"COMMAND: /start from user {update.effective_user.id}")
     await update.message.reply_text("Hello! I'm your AI bot powered by OpenAI. Send me a message!")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"COMMAND: /stats from user {update.effective_user.id}")
     telegram_id = update.effective_user.id
     count, history = get_user_stats(telegram_id)
     
@@ -148,19 +162,25 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"\n{'='*50}")
+    print(f"MESSAGE RECEIVED from {update.effective_user.id}")
+    print(f"Text: {update.message.text[:50]}...")
+    print(f"{'='*50}\n")
+    
     user_message = update.message.text
     user = update.effective_user
-    
-    print(f"DEBUG: Received message from {user.id}: {user_message[:30]}...")  # Debug output
     
     await update.message.chat.send_action(action="typing")
     
     # Get AI response from OpenAI
+    print("Getting AI response...")
     ai_response = get_openai_response(user_message)
+    print(f"AI response: {ai_response[:50]}...")
+    
     await update.message.reply_text(ai_response)
     
     # Save to database
-    print(f"DEBUG: About to save conversation...")  # Debug output
+    print("Saving to database...")
     save_conversation(
         telegram_id=user.id,
         username=user.username,
@@ -168,13 +188,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg=user_message,
         bot_msg=ai_response
     )
-    print(f"DEBUG: Conversation saved!")  # Debug output
+    print("Done!\n")
 
 def main():
+    print("\n" + "="*50)
+    print("MAIN FUNCTION STARTING")
+    print("="*50 + "\n")
+    
     # Initialize database tables on startup!
     print("Initializing database...")
     init_db()
-    print("Database initialized!")
+    print("Database initialized!\n")
     
     if not TELEGRAM_TOKEN:
         print("ERROR: TELEGRAM_BOT_TOKEN not set!")
@@ -182,12 +206,19 @@ def main():
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # Add handlers
+    # Add handlers - IMPORTANT: MessageHandler should catch all text messages
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
+    
+    # This should catch all text messages that are not commands
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("Bot is running with OpenAI! Message it on Telegram!")
+    print("Handlers registered:")
+    print("- /start command")
+    print("- /stats command")
+    print("- text messages (not commands)")
+    print("\nBot is running! Send a message on Telegram!\n")
+    
     application.run_polling()
 
 if __name__ == "__main__":
