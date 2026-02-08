@@ -2,15 +2,14 @@ import logging
 import os
 import sys
 import requests
-import asyncio
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 # Database code inline
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime, timedelta
+from datetime import datetime
 
 print("="*50)
 print("BOT STARTING UP...")
@@ -26,7 +25,6 @@ class User(Base):
     username = Column(String)
     first_name = Column(String)
     message_count = Column(Integer, default=0)
-    last_active = Column(DateTime, default=datetime.utcnow)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Conversation(Base):
@@ -82,16 +80,6 @@ def get_all_users():
     finally:
         session.close()
 
-def get_inactive_users(days=7):
-    """Get users who haven't been active in X days"""
-    session = SessionLocal()
-    try:
-        cutoff = datetime.utcnow() - timedelta(days=days)
-        users = session.query(User).filter(User.last_active < cutoff).all()
-        return users
-    finally:
-        session.close()
-
 def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
     """Save conversation to database"""
     print(f"SAVING CONVERSATION for user {telegram_id}")
@@ -110,7 +98,6 @@ def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
             user.message_count = 0
         
         user.message_count += 1
-        user.last_active = datetime.utcnow()  # Update last active time
         print(f"User message count: {user.message_count}")
         
         # Save conversation
@@ -170,7 +157,7 @@ def get_openai_response(message):
         print(f"OpenAI error: {e}")
         return f"Error: {str(e)}"
 
-# AGENT FEATURES - Simple version without job queue (to avoid errors)
+# AGENT FEATURES
 
 async def welcome_new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Agent feature: Enhanced welcome for new users"""
@@ -241,17 +228,16 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def agent_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show agent status"""
     users = get_all_users()
-    inactive = get_inactive_users(days=3)
     
     msg = f"""🤖 Agent Status:
     
 Total users: {len(users)}
-Inactive (3+ days): {len(inactive)}
 
 Agent features active:
 ✅ User tracking
 ✅ Stats monitoring
 ✅ Admin broadcast
+✅ New user welcome
 """
     await update.message.reply_text(msg)
 
@@ -298,7 +284,7 @@ def main():
         print("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    # Create application (simpler version without job queue)
+    # Create application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Add handlers
