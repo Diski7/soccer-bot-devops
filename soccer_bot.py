@@ -4,7 +4,7 @@ import sys
 import requests
 import asyncio
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler, JobQueue
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
 # Database code inline
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
@@ -170,43 +170,7 @@ def get_openai_response(message):
         print(f"OpenAI error: {e}")
         return f"Error: {str(e)}"
 
-# AGENT FEATURES - Automated tasks
-
-async def daily_stats_job(context):
-    """Agent feature: Send daily stats to all users at 9 AM"""
-    print("AGENT: Running daily stats job...")
-    users = get_all_users()
-    
-    for user in users:
-        try:
-            count, history = get_user_stats(user.telegram_id)
-            if count > 0:
-                msg = f"📊 Your Daily Summary!\n\nYou've sent {count} messages total.\n"
-                if history:
-                    msg += "\nRecent chats:\n"
-                    for conv in history[:3]:
-                        msg += f"- {conv.user_message[:30]}...\n"
-                await context.bot.send_message(chat_id=int(user.telegram_id), text=msg)
-                print(f"AGENT: Sent daily stats to {user.telegram_id}")
-        except Exception as e:
-            print(f"AGENT ERROR: Could not send to {user.telegram_id}: {e}")
-    
-    print("AGENT: Daily stats job complete!")
-
-async def inactive_user_reminder(context):
-    """Agent feature: Remind inactive users"""
-    print("AGENT: Checking for inactive users...")
-    inactive_users = get_inactive_users(days=3)  # 3 days inactive
-    
-    for user in inactive_users:
-        try:
-            msg = f"👋 Hey {user.first_name or 'there'}! Haven't heard from you in a while. Come chat with me!"
-            await context.bot.send_message(chat_id=int(user.telegram_id), text=msg)
-            print(f"AGENT: Sent reminder to inactive user {user.telegram_id}")
-        except Exception as e:
-            print(f"AGENT ERROR: Could not remind {user.telegram_id}: {e}")
-    
-    print("AGENT: Inactive user check complete!")
+# AGENT FEATURES - Simple version without job queue (to avoid errors)
 
 async def welcome_new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Agent feature: Enhanced welcome for new users"""
@@ -228,25 +192,7 @@ I'm your AI assistant powered by OpenAI. I can:
 Try sending me a message!"""
         
         await update.message.reply_text(welcome_msg)
-        
-        # Agent: Schedule a follow-up in 1 hour
-        context.job_queue.run_once(
-            follow_up_new_user, 
-            when=3600,  # 1 hour later
-            chat_id=telegram_id,
-            name=f"follow_up_{telegram_id}"
-        )
-        print(f"AGENT: Scheduled follow-up for new user {telegram_id}")
-
-async def follow_up_new_user(context):
-    """Agent feature: Follow up with new users after 1 hour"""
-    chat_id = context.job.chat_id
-    try:
-        msg = "👋 How are you enjoying our chat? Don't forget you can check your stats with /stats anytime!"
-        await context.bot.send_message(chat_id=chat_id, text=msg)
-        print(f"AGENT: Sent follow-up to {chat_id}")
-    except Exception as e:
-        print(f"AGENT ERROR: Follow-up failed: {e}")
+        print(f"AGENT: Sent welcome to new user {telegram_id}")
 
 # Command handlers
 
@@ -270,7 +216,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command to send message to all users (agent feature)"""
     # Only allow for specific admin (you can change this)
-    if str(update.effective_user.id) != str(os.getenv("ADMIN_TELEGRAM_ID", "")):
+    admin_id = os.getenv("ADMIN_TELEGRAM_ID", "")
+    if not admin_id or str(update.effective_user.id) != admin_id:
         await update.message.reply_text("⛔ Admin only command!")
         return
     
@@ -290,6 +237,23 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             print(f"Broadcast failed to {user.telegram_id}: {e}")
     
     await update.message.reply_text(f"Broadcast sent to {sent_count} users!")
+
+async def agent_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show agent status"""
+    users = get_all_users()
+    inactive = get_inactive_users(days=3)
+    
+    msg = f"""🤖 Agent Status:
+    
+Total users: {len(users)}
+Inactive (3+ days): {len(inactive)}
+
+Agent features active:
+✅ User tracking
+✅ Stats monitoring
+✅ Admin broadcast
+"""
+    await update.message.reply_text(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f"\n{'='*50}")
@@ -334,39 +298,24 @@ def main():
         print("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    # Create application with job queue for agent features
+    # Create application (simpler version without job queue)
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("agent", agent_status))
     
     # This should catch all text messages that are not commands
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # AGENT: Schedule automated jobs
-    print("Setting up agent jobs...")
-    
-    # Daily stats at 9:00 AM UTC
-    application.job_queue.run_daily(
-        daily_stats_job,
-        time=datetime.time(hour=9, minute=0),
-        name="daily_stats"
-    )
-    
-    # Check for inactive users every day at 10:00 AM UTC
-    application.job_queue.run_daily(
-        inactive_user_reminder,
-        time=datetime.time(hour=10, minute=0),
-        name="inactive_reminder"
-    )
-    
-    print("Agent jobs scheduled:")
-    print("- Daily stats at 9:00 AM UTC")
-    print("- Inactive user reminders at 10:00 AM UTC")
-    print("- Auto follow-up for new users")
-    
+    print("Handlers registered:")
+    print("- /start command")
+    print("- /stats command")
+    print("- /broadcast command (admin)")
+    print("- /agent command")
+    print("- text messages (not commands)")
     print("\nBot is running with AGENT features! Send a message on Telegram!\n")
     
     application.run_polling()
