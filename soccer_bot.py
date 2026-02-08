@@ -1,118 +1,173 @@
 import logging
-import requests
 import os
-from dotenv import load_dotenv
+import sys
+import requests
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
-# Load environment variables
-load_dotenv()
+# Database code inline
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String, unique=True)
+    username = Column(String)
+    first_name = Column(String)
+    message_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class Conversation(Base):
+    __tablename__ = 'conversations'
+    
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String)
+    user_message = Column(Text)
+    bot_response = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Get database URL from environment
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+
+# Handle Railway's postgres:// vs postgresql://
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+
+def init_db():
+    """Create tables"""
+    Base.metadata.create_all(engine)
+
+def get_user_stats(telegram_id):
+    """Get user statistics"""
+    session = SessionLocal()
+    user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
+    
+    if user:
+        count = user.message_count
+        history = session.query(Conversation).filter_by(telegram_id=str(telegram_id)).order_by(Conversation.timestamp.desc()).limit(5).all()
+        session.close()
+        return count, history
+    session.close()
+    return 0, []
+
+def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
+    """Save conversation to database"""
+    session = SessionLocal()
+    
+    # Update or create user
+    user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
+    if not user:
+        user = User(telegram_id=str(telegram_id), username=username, first_name=first_name)
+        session.add(user)
+    
+    user.message_count += 1
+    
+    # Save conversation
+    conv = Conversation(
+        telegram_id=str(telegram_id),
+        user_message=user_msg,
+        bot_response=bot_msg
+    )
+    session.add(conv)
+    
+    session.commit()
+    session.close()
+
+# Bot configuration - all from environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-
-# Detect which AI to use
-USE_OPENAI = OPENAI_API_KEY is not None and len(OPENAI_API_KEY) > 10
-
-SYSTEM_PROMPT = """You are now functioning as my athletic strategist, college soccer recruitment specialist, creative athletic development director, and positioning expert; for every response:
-• Think critically
-• Speak like a seasoned operator (if you use acronyms, share in full in brackets)
-• Challenge assumptions
-• Offer structured feedback, not just answers
-• Teach after each output in a short paragraph so I learn with you
-• If you are not sure about something, do not hallucinate. Find help from other agents and critically think for the best answer.
-• Do not ever use the word 'delve', or dashes in sentences "—"
-• Be direct, concise, and human. No corporate fluff."""
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+DEFAULT_MODEL = "gpt-3.5-turbo"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-def get_openai_response(prompt):
-    """Call OpenAI API"""
+def get_openai_response(message):
+    """Get response from OpenAI API"""
+    if not OPENAI_API_KEY:
+        return "OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+    
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
     
     data = {
-        "model": "gpt-4o-mini",
+        "model": DEFAULT_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": message}
         ],
-        "temperature": 0.7
+        "max_tokens": 500
     }
     
-    response = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json=data,
-        timeout=30
-    )
-    
-    response.raise_for_status()
-    return response.json()['choices'][0]['message']['content']
-
-def get_ollama_response(prompt, model="qwen2.5:1.5b"):
-    """Call local Ollama API"""
     try:
-        response = requests.post(OLLAMA_URL, json={
-            "model": model,
-            "prompt": f"{SYSTEM_PROMPT}\n\nUser: {prompt}",
-            "stream": False
-        }, timeout=60)
+        response = requests.post(OPENAI_URL, headers=headers, json=data, timeout=30)
         response.raise_for_status()
-        return response.json().get('response', 'No response')
+        return response.json()['choices'][0]['message']['content']
     except Exception as e:
-        return f"Error connecting to Ollama: {str(e)}"
+        return f"Error getting AI response: {str(e)}"
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hello! I'm your AI bot powered by OpenAI. Send me a message!")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    count, history = get_user_stats(telegram_id)
+    
+    if count == 0:
+        await update.message.reply_text("No stats yet. Start chatting first!")
+    else:
+        msg = f"📊 Your Stats:\nMessages sent: {count}\n\nRecent conversations:\n"
+        for conv in history:
+            msg += f"- You: {conv.user_message[:30]}...\n"
+        await update.message.reply_text(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
+    user = update.effective_user
+    
     await update.message.chat.send_action(action="typing")
     
-    try:
-        if USE_OPENAI:
-            ai_response = get_openai_response(user_message)
-        else:
-            ai_response = get_ollama_response(user_message)
-            
-        await update.message.reply_text(ai_response)
-        
-    except Exception as e:
-        await update.message.reply_text(f"Error: {str(e)}")
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.chat.send_action(action="typing")
+    # Get AI response from OpenAI
+    ai_response = get_openai_response(user_message)
+    await update.message.reply_text(ai_response)
     
-    if USE_OPENAI:
-        await update.message.reply_text("📸 Image analysis: I can see this is a soccer-related image! For detailed tactical analysis, please describe what you see or use the local version with Ollama.")
-    else:
-        # Local Ollama vision
-        photo_file = await update.message.photo[-1].get_file()
-        photo_path = f"/tmp/telegram_{update.message.message_id}.jpg"
-        await photo_file.download_to_drive(photo_path)
-        
-        try:
-            response = requests.post(OLLAMA_URL, json={
-                "model": "moondream",
-                "prompt": f"{SYSTEM_PROMPT}\n\nAnalyze this soccer image.",
-                "images": [photo_path],
-                "stream": False
-            }, timeout=60)
-            ai_response = response.json().get('response', 'No analysis')
-            await update.message.reply_text(ai_response)
-        except Exception as e:
-            await update.message.reply_text(f"Vision error: {str(e)}")
+    # Save to database
+    save_conversation(
+        telegram_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        user_msg=user_message,
+        bot_msg=ai_response
+    )
 
 def main():
-    print(f"🚀 Strategist Bot starting...")
-    print(f"🤖 Mode: {'OpenAI Cloud' if USE_OPENAI else 'Ollama Local'}")
-    print(f"💰 Cost: {'~$0.0001/msg' if USE_OPENAI else 'FREE (Mac must be on)'}")
+    # Initialize database tables on startup!
+    print("Initializing database...")
+    init_db()
+    print("Database initialized!")
+    
+    if not TELEGRAM_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN not set!")
+        return
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    print("✅ Bot is running!")
+    
+    print("Bot is running with OpenAI! Message it on Telegram!")
     application.run_polling()
 
 if __name__ == "__main__":
