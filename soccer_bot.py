@@ -34,6 +34,7 @@ class Conversation(Base):
 
 # Get database URL from environment
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
+print(f"DEBUG: DATABASE_URL = {DATABASE_URL[:20]}...")  # Debug output
 
 # Handle Railway's postgres:// vs postgresql://
 if DATABASE_URL.startswith('postgres://'):
@@ -44,10 +45,13 @@ SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
     """Create tables"""
+    print("DEBUG: Creating tables...")  # Debug output
     Base.metadata.create_all(engine)
+    print("DEBUG: Tables created!")  # Debug output
 
 def get_user_stats(telegram_id):
     """Get user statistics"""
+    print(f"DEBUG: Getting stats for user {telegram_id}")  # Debug output
     session = SessionLocal()
     user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
     
@@ -55,32 +59,44 @@ def get_user_stats(telegram_id):
         count = user.message_count
         history = session.query(Conversation).filter_by(telegram_id=str(telegram_id)).order_by(Conversation.timestamp.desc()).limit(5).all()
         session.close()
+        print(f"DEBUG: Found user with {count} messages")  # Debug output
         return count, history
     session.close()
+    print("DEBUG: User not found")  # Debug output
     return 0, []
 
 def save_conversation(telegram_id, username, first_name, user_msg, bot_msg):
     """Save conversation to database"""
+    print(f"DEBUG: Saving conversation for user {telegram_id}")  # Debug output
     session = SessionLocal()
     
-    # Update or create user
-    user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
-    if not user:
-        user = User(telegram_id=str(telegram_id), username=username, first_name=first_name)
-        session.add(user)
-    
-    user.message_count += 1
-    
-    # Save conversation
-    conv = Conversation(
-        telegram_id=str(telegram_id),
-        user_message=user_msg,
-        bot_response=bot_msg
-    )
-    session.add(conv)
-    
-    session.commit()
-    session.close()
+    try:
+        # Update or create user
+        user = session.query(User).filter_by(telegram_id=str(telegram_id)).first()
+        if not user:
+            print(f"DEBUG: Creating new user {telegram_id}")  # Debug output
+            user = User(telegram_id=str(telegram_id), username=username, first_name=first_name)
+            session.add(user)
+        
+        user.message_count += 1
+        print(f"DEBUG: User message count now {user.message_count}")  # Debug output
+        
+        # Save conversation
+        conv = Conversation(
+            telegram_id=str(telegram_id),
+            user_message=user_msg,
+            bot_response=bot_msg
+        )
+        session.add(conv)
+        print("DEBUG: Conversation added, committing...")  # Debug output
+        
+        session.commit()
+        print("DEBUG: Saved successfully!")  # Debug output
+    except Exception as e:
+        print(f"DEBUG: Error saving: {e}")  # Debug output
+        session.rollback()
+    finally:
+        session.close()
 
 # Bot configuration - all from environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -135,6 +151,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_message = update.message.text
     user = update.effective_user
     
+    print(f"DEBUG: Received message from {user.id}: {user_message[:30]}...")  # Debug output
+    
     await update.message.chat.send_action(action="typing")
     
     # Get AI response from OpenAI
@@ -142,6 +160,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(ai_response)
     
     # Save to database
+    print(f"DEBUG: About to save conversation...")  # Debug output
     save_conversation(
         telegram_id=user.id,
         username=user.username,
@@ -149,6 +168,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_msg=user_message,
         bot_msg=ai_response
     )
+    print(f"DEBUG: Conversation saved!")  # Debug output
 
 def main():
     # Initialize database tables on startup!
