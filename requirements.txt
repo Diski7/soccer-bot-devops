@@ -1,6 +1,5 @@
-python-telegram-bot==21.10
-requests==2.31.0
-python-dotenv==1.0.0
-openai==1.0.0
-sqlalchemy
+python-telegram-bot>=20.0
+sqlalchemy>=2.0.0
 psycopg2-binary
+requests
+python-dotenv
