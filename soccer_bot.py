@@ -90,6 +90,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+PORT = int(os.getenv("PORT", "8080"))
+RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
 
 # LLM Configuration
 USE_OPENAI = bool(OPENAI_API_KEY)
@@ -408,8 +410,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Exception while handling an update: {context.error}")
     
     if isinstance(context.error, Conflict):
-        logger.error("Conflict error detected. Waiting before retry...")
-        await asyncio.sleep(10)
+        logger.error("Conflict error detected. This means another instance is running.")
+        # Don't crash, just log it
         return
     
     if isinstance(context.error, (NetworkError, TimedOut)):
@@ -442,12 +444,26 @@ def main():
     logger.info("Bot running with LIFETIME memory + LLM!")
     logger.info(f"OpenAI: {USE_OPENAI}, Ollama: {USE_OLLAMA}")
     
-    # Run
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-        close_loop=False
-    )
+    # Check if we should use webhooks (production) or polling (development)
+    if RAILWAY_STATIC_URL:
+        # Production: Use webhooks
+        webhook_url = f"{RAILWAY_STATIC_URL}/webhook"
+        logger.info(f"Using webhook at {webhook_url}")
+        
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=webhook_url,
+            drop_pending_updates=True
+        )
+    else:
+        # Development: Use polling
+        logger.info("Using polling (development mode)")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
 
 if __name__ == "__main__":
     main()
