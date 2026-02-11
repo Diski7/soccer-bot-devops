@@ -2,6 +2,8 @@ import logging
 import os
 import sys
 import time
+import openai
+import requests
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -83,14 +85,29 @@ def init_db():
 def get_db():
     return SessionLocal()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Environment variables
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+# LLM Configuration
+USE_OPENAI = bool(OPENAI_API_KEY)
+USE_OLLAMA = bool(OLLAMA_URL and not USE_OPENAI)
+
+if USE_OPENAI:
+    openai.api_key = OPENAI_API_KEY
+    logger.info("Using OpenAI for LLM")
+elif USE_OLLAMA:
+    logger.info(f"Using Ollama at {OLLAMA_URL}")
+else:
+    logger.warning("No LLM configured - running in memory-only mode")
 
 def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
 
-def get_all_memory(telegram_id: str, max_messages: int = 1000):
-    """Fetch ALL conversations - lifetime memory"""
+def get_all_memory(telegram_id: str, max_messages: int = 20):
+    """Fetch recent conversations for context"""
     db = get_db()
     try:
         history = db.query(Conversation).filter(
@@ -190,6 +207,61 @@ def get_recent_activity(telegram_id: str) -> dict:
     finally:
         db.close()
 
+def get_llm_response(user_message: str, conversation_history: list, memory_summary: dict) -> str:
+    """Get response from LLM with memory context"""
+    
+    # Build conversation context from memory
+    context = "You are a knowledgeable soccer assistant with LIFETIME memory. You remember all past conversations with this user.\n\n"
+    
+    if memory_summary["total_messages"] > 0:
+        context += f"User: {memory_summary['user_name']}\n"
+        context += f"Relationship: {memory_summary['time_since_first']}\n"
+        context += f"Total messages: {memory_summary['total_messages']}\n\n"
+    
+    # Add recent conversation history
+    if conversation_history:
+        context += "Recent conversation history:\n"
+        for conv in conversation_history[-10:]:  # Last 10 messages
+            context += f"User: {conv.user_message}\n"
+            context += f"Assistant: {conv.bot_response}\n\n"
+    
+    context += f"Current user message: {user_message}\n\n"
+    context += "Respond as a helpful soccer expert. Be conversational and reference previous discussions if relevant."
+    
+    try:
+        if USE_OPENAI:
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful soccer assistant with perfect memory of all past conversations."},
+                    {"role": "user", "content": context}
+                ],
+                max_tokens=500,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+            
+        elif USE_OLLAMA:
+            response = requests.post(
+                f"{OLLAMA_URL}/api/generate",
+                json={
+                    "model": "llama2",
+                    "prompt": context,
+                    "stream": False,
+                    "max_tokens": 500
+                },
+                timeout=30
+            )
+            return response.json().get("response", "I couldn't generate a response right now.")
+        
+        else:
+            # Fallback without LLM
+            return None
+            
+    except Exception as e:
+        logger.error(f"LLM error: {e}")
+        return None
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     telegram_id = str(user.id)
@@ -209,13 +281,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if memory["years_together"] >= 1:
             welcome += f"🎉 Happy {memory['years_together']}-year anniversary! 🎂\n\n"
         
-        welcome += "What would you like to discuss today?"
+        welcome += "Ask me anything about soccer!"
     else:
         welcome = (
             "Hello! I'm your soccer assistant with LIFETIME memory! ⚽🧠\n\n"
             "I will remember every single conversation we have - forever. "
-            "No time limits, no expiration. Your soccer journey with me is archived for life!\n\n"
-            "Ask me anything about soccer, training, or matches!"
+            "Ask me anything about soccer, formations, tactics, players, or matches!"
         )
     
     await update.message.reply_text(welcome)
@@ -225,65 +296,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(user.id)
     current_message = update.message.text
     
-    history = get_all_memory(telegram_id, max_messages=1000)
+    # Get memory
+    history = get_all_memory(telegram_id, max_messages=20)
     memory = get_memory_summary(telegram_id)
     activity = get_recent_activity(telegram_id)
     
     current_lower = current_message.lower()
     
+    # Check for memory-related commands first
     if "remember" in current_lower or "recall" in current_lower:
-        if memory["total_messages"] > 0:
-            response = (
-                f"Of course! I have LIFETIME memory 🧠\n\n"
-                f"📅 We've known each other for {memory['time_since_first']}\n"
-                f"💬 {memory['total_messages']} total messages\n"
-                f"🎂 Since: {memory['first_chat']}\n\n"
-                f"I remember every single conversation. What would you like me to recall?"
-            )
-        else:
-            response = "We're just getting started! I'll remember this conversation forever."
+        response = (
+            f"Of course! I have LIFETIME memory 🧠\n\n"
+            f"📅 We've known each other for {memory['time_since_first']}\n"
+            f"💬 {memory['total_messages']} total messages\n"
+            f"🎂 Since: {memory['first_chat']}\n\n"
+            f"I remember every single conversation. What soccer topic would you like to discuss?"
+        )
     
     elif "how long" in current_lower or "history" in current_lower:
-        if memory["total_messages"] > 0:
-            response = (
-                f"📊 Our Lifetime History:\n\n"
-                f"⏰ Together for: {memory['time_since_first']}\n"
-                f"🎂 First chat: {memory['first_chat']}\n"
-                f"💬 Total messages: {memory['total_messages']}\n"
-                f"🧠 Memory type: LIFETIME (no expiration)\n\n"
-                f"Recent activity:\n"
-                f"• Last hour: {activity['last_hour']}\n"
-                f"• Today: {activity['last_24h']}\n"
-                f"• This week: {activity['last_7d']}"
-            )
-        else:
-            response = "Our journey starts now! I have LIFETIME memory - I'll never forget a single message."
-    
-    elif "anniversary" in current_lower:
-        if memory["years_together"] >= 1:
-            response = (
-                f"🎉🎂 HAPPY {memory['years_together']}-YEAR ANNIVERSARY! 🎂🎉\n\n"
-                f"Incredible! We've been chatting for {memory['time_since_first']}!\n"
-                f"{memory['total_messages']} messages together.\n"
-                f"Thank you for being part of my soccer community! ⚽"
-            )
-        elif memory["months_together"] > 0:
-            response = (
-                f"We're {memory['months_together']} months into our journey! "
-                f"In {12 - memory['months_together']} months we'll celebrate our 1-year anniversary! 🎂"
-            )
-        else:
-            response = "Our anniversary is coming up! I'll be here to celebrate every year with you! 🎉"
-    
-    elif "first chat" in current_lower or "when did we meet" in current_lower:
-        if memory["total_messages"] > 0:
-            response = (
-                f"We first met on {memory['first_chat']}!\n"
-                f"That's {memory['time_since_first']} ago!\n"
-                f"I knew from that first message that this would be a special soccer friendship ⚽"
-            )
-        else:
-            response = "We just met right now! This is the start of our lifetime soccer journey!"
+        response = (
+            f"📊 Our Lifetime History:\n\n"
+            f"⏰ Together for: {memory['time_since_first']}\n"
+            f"🎂 First chat: {memory['first_chat']}\n"
+            f"💬 Total messages: {memory['total_messages']}\n"
+            f"🧠 Memory type: LIFETIME (no expiration)"
+        )
     
     elif "stats" in current_lower or "numbers" in current_lower:
         response = (
@@ -292,53 +329,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔥 Last hour: {activity['last_hour']}\n"
             f"📅 Today: {activity['last_24h']}\n"
             f"📊 This week: {activity['last_7d']}\n"
-            f"⏰ Journey length: {memory['time_since_first']}\n\n"
-            f"And counting... forever! 🧠"
-        )
-    
-    elif "delete" in current_lower or "forget me" in current_lower:
-        response = (
-            "I understand you want to be forgotten. As an admin, you can delete your data. "
-            "Use /delete_my_data command (admin only)."
-        )
-    
-    elif memory["years_together"] >= 5:
-        response = (
-            f"Hey {memory['user_name']}! {memory['years_together']} YEARS together! 🎉\n"
-            f"I'm practically your soccer historian now! What do you need?"
-        )
-    
-    elif memory["years_together"] >= 1:
-        response = (
-            f"Welcome back {memory['user_name']}! Year {memory['years_together']} of our soccer journey! "
-            f"{memory['total_messages']} messages and counting. What's up?"
-        )
-    
-    elif memory["months_together"] >= 6:
-        response = (
-            f"Hey {memory['user_name']}! {memory['months_together']} months of soccer chats! "
-            f"Building quite the archive together. What would you like to discuss?"
-        )
-    
-    elif memory["total_messages"] > 10:
-        response = (
-            f"Welcome back {memory['user_name']}! {memory['total_messages']} messages in our lifetime archive. "
-            f"What soccer topics shall we explore today?"
-        )
-    
-    elif memory["total_messages"] > 0:
-        response = (
-            f"Welcome back {memory['user_name']}! Message #{memory['total_messages'] + 1} in our lifetime memory. "
-            f"What would you like to chat about?"
+            f"⏰ Journey length: {memory['time_since_first']}"
         )
     
     else:
-        response = (
-            "Hi! I'm your soccer assistant with LIFETIME memory! ⚽🧠\n\n"
-            "This is the first message of our forever-archive. "
-            "Ask me anything about soccer!"
-        )
+        # Get LLM response with memory context
+        llm_response = get_llm_response(current_message, history, memory)
+        
+        if llm_response:
+            response = llm_response
+        else:
+            # Fallback responses if LLM fails
+            if memory["total_messages"] > 10:
+                response = f"Welcome back {memory['user_name']}! {memory['total_messages']} messages in our lifetime archive. What soccer topics shall we explore today?"
+            elif memory["total_messages"] > 0:
+                response = f"Welcome back {memory['user_name']}! Message #{memory['total_messages'] + 1} in our lifetime memory. What would you like to chat about?"
+            else:
+                response = "Hi! Ask me anything about soccer - formations, tactics, players, or matches!"
     
+    # Send response
     await update.message.reply_text(response)
     
     # SAVE TO LIFETIME MEMORY
@@ -400,7 +409,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     
     if isinstance(context.error, Conflict):
         logger.error("Conflict error detected. Waiting before retry...")
-        # Don't exit, just wait and let it retry
         await asyncio.sleep(10)
         return
     
@@ -415,7 +423,7 @@ def main():
         logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    # Build application with settings to prevent conflicts
+    # Build application
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -431,10 +439,10 @@ def main():
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("Bot running with LIFETIME memory!")
-    logger.info("Never forgets - all conversations stored forever")
+    logger.info("Bot running with LIFETIME memory + LLM!")
+    logger.info(f"OpenAI: {USE_OPENAI}, Ollama: {USE_OLLAMA}")
     
-    # Run with settings to avoid conflicts
+    # Run
     application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES,
