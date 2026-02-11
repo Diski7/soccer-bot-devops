@@ -6,12 +6,13 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 import requests
+from sqlalchemy import text
 
 # ============== DATABASE CODE ==============
 
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import sessionmaker
 import enum
 
 Base = declarative_base()
@@ -58,11 +59,23 @@ engine = create_engine(get_database_url())
 SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
-    print("🔧 Dropping old tables...")
-    Base.metadata.drop_all(engine)  # DROP OLD TABLES
+    print("🔧 Checking database...")
+    
+    # For PostgreSQL, use CASCADE to drop everything
+    if 'postgresql' in str(engine.url):
+        print("🔧 PostgreSQL detected - using CASCADE...")
+        with engine.connect() as conn:
+            # Drop all tables with CASCADE
+            conn.execute(text("DROP TABLE IF EXISTS user_analytics CASCADE"))
+            conn.execute(text("DROP TABLE IF EXISTS match_predictions CASCADE"))
+            conn.execute(text("DROP TABLE IF EXISTS conversations CASCADE"))
+            conn.execute(text("DROP TABLE IF EXISTS users CASCADE"))
+            conn.commit()
+            print("🔧 Old tables dropped!")
+    
     print("🔧 Creating new tables...")
-    Base.metadata.create_all(engine)  # CREATE NEW ONES
-    print("✅ Database recreated!")
+    Base.metadata.create_all(engine)
+    print("✅ Database ready!")
 
 def get_db():
     db = SessionLocal()
@@ -207,10 +220,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.chat.send_action(action="typing")
     
-    # Get or create user
     db_user = get_or_create_user(telegram_id, user.username, user.first_name, user.last_name)
     
-    # AI Response
     try:
         response = requests.post(
             "https://api.openai.com/v1/chat/completions",
@@ -235,7 +246,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(ai_response)
     
-    # Log to database
     db = get_db()
     try:
         db_user.message_count += 1
