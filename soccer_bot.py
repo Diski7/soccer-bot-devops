@@ -1,12 +1,22 @@
 import logging
 import os
+import sys
+import time
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect, text
+from telegram.error import Conflict, NetworkError
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
+
+# Setup logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 Base = declarative_base()
 
@@ -48,29 +58,24 @@ def init_db():
     try:
         inspector = inspect(engine)
         
-        # Check if tables exist with correct schema
         if 'conversations' in inspector.get_table_names():
             columns = [col['name'] for col in inspector.get_columns('conversations')]
-            
-            # If missing required columns, recreate tables
             required_cols = ['user_message', 'bot_response', 'timestamp']
             if not all(col in columns for col in required_cols):
-                print("Schema outdated, recreating tables...")
+                logger.info("Schema outdated, recreating tables...")
                 Base.metadata.drop_all(engine)
         
-        # Create all tables
         Base.metadata.create_all(engine)
-        print("Database ready!")
+        logger.info("Database ready!")
         
     except Exception as e:
-        print(f"Database error: {e}")
-        # Force recreate on error
+        logger.error(f"Database error: {e}")
         try:
             Base.metadata.drop_all(engine)
         except:
             pass
         Base.metadata.create_all(engine)
-        print("Database recreated!")
+        logger.info("Database recreated!")
     finally:
         db.close()
 
@@ -361,7 +366,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error saving to database: {e}")
         db.rollback()
     finally:
         db.close()
@@ -382,26 +387,49 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.commit()
         await update.message.reply_text("All your data has been deleted. Start fresh!")
     except Exception as e:
-        print(f"Error deleting data: {e}")
+        logger.error(f"Error deleting data: {e}")
         db.rollback()
         await update.message.reply_text("Error deleting data.")
     finally:
         db.close()
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors"""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    if isinstance(context.error, Conflict):
+        logger.error("Conflict error: Another bot instance is running. Shutting down...")
+        # Exit gracefully so Railway can restart a single instance
+        sys.exit(1)
+
 def main():
     init_db()
+    
     if not TELEGRAM_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN not set!")
+        logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Build application with custom settings to avoid conflicts
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(False)  # Prevent concurrent updates that cause conflicts
+        .build()
+    )
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    print("Bot running with LIFETIME memory!")
-    print("Never forgets - all conversations stored forever")
-    application.run_polling()
+    logger.info("Bot running with LIFETIME memory!")
+    logger.info("Never forgets - all conversations stored forever")
+    
+    # Run with drop_pending_updates to clear any stuck updates
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
