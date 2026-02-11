@@ -5,11 +5,12 @@ import time
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from telegram.error import Conflict, NetworkError
+from telegram.error import Conflict, NetworkError, TimedOut
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
+import asyncio
 
 # Setup logging
 logging.basicConfig(
@@ -394,13 +395,18 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors"""
+    """Handle errors gracefully"""
     logger.error(f"Exception while handling an update: {context.error}")
     
     if isinstance(context.error, Conflict):
-        logger.error("Conflict error: Another bot instance is running. Shutting down...")
-        # Exit gracefully so Railway can restart a single instance
-        sys.exit(1)
+        logger.error("Conflict error detected. Waiting before retry...")
+        # Don't exit, just wait and let it retry
+        await asyncio.sleep(10)
+        return
+    
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        logger.warning("Network error. Will retry automatically...")
+        return
 
 def main():
     init_db()
@@ -409,11 +415,11 @@ def main():
         logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    # Build application with custom settings to avoid conflicts
+    # Build application with settings to prevent conflicts
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
-        .concurrent_updates(False)  # Prevent concurrent updates that cause conflicts
+        .concurrent_updates(False)
         .build()
     )
     
@@ -428,8 +434,12 @@ def main():
     logger.info("Bot running with LIFETIME memory!")
     logger.info("Never forgets - all conversations stored forever")
     
-    # Run with drop_pending_updates to clear any stuck updates
-    application.run_polling(drop_pending_updates=True)
+    # Run with settings to avoid conflicts
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        close_loop=False
+    )
 
 if __name__ == "__main__":
     main()
