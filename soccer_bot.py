@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
@@ -43,8 +43,36 @@ engine = create_engine(get_database_url())
 SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
-    Base.metadata.create_all(engine)
-    print("Database ready!")
+    """Initialize database with schema migration support"""
+    db = get_db()
+    try:
+        inspector = inspect(engine)
+        
+        # Check if tables exist with correct schema
+        if 'conversations' in inspector.get_table_names():
+            columns = [col['name'] for col in inspector.get_columns('conversations')]
+            
+            # If missing required columns, recreate tables
+            required_cols = ['user_message', 'bot_response', 'timestamp']
+            if not all(col in columns for col in required_cols):
+                print("Schema outdated, recreating tables...")
+                Base.metadata.drop_all(engine)
+        
+        # Create all tables
+        Base.metadata.create_all(engine)
+        print("Database ready!")
+        
+    except Exception as e:
+        print(f"Database error: {e}")
+        # Force recreate on error
+        try:
+            Base.metadata.drop_all(engine)
+        except:
+            pass
+        Base.metadata.create_all(engine)
+        print("Database recreated!")
+    finally:
+        db.close()
 
 def get_db():
     return SessionLocal()
@@ -56,45 +84,34 @@ def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
 
 def get_all_memory(telegram_id: str, max_messages: int = 1000):
-    """
-    Fetch ALL conversations - lifetime memory, no expiration
-    """
+    """Fetch ALL conversations - lifetime memory"""
     db = get_db()
     try:
-        # Get ALL messages for this user, forever
         history = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(desc(Conversation.timestamp)).limit(max_messages).all()
-        
         return list(reversed(history))
     finally:
         db.close()
 
 def get_memory_summary(telegram_id: str):
-    """
-    Create summary of entire lifetime relationship
-    """
+    """Create summary of entire lifetime relationship"""
     db = get_db()
     try:
-        # Count ALL conversations ever
         total_convos = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).count()
         
-        # Get first conversation ever
         first_convo = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(Conversation.timestamp).first()
         
-        # Get most recent conversation
         last_convo = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(desc(Conversation.timestamp)).first()
         
-        # Get user info
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
         
-        # Calculate relationship length
         if first_convo:
             time_since_first = datetime.utcnow() - first_convo.timestamp
             days_together = time_since_first.days
@@ -120,7 +137,6 @@ def get_memory_summary(telegram_id: str):
         db.close()
 
 def format_duration(td: timedelta) -> str:
-    """Format timedelta into human readable string"""
     days = td.days
     years = days // 365
     months = (days % 365) // 30
@@ -131,35 +147,29 @@ def format_duration(td: timedelta) -> str:
         parts.append(f"{years} year{'s' if years != 1 else ''}")
     if months > 0:
         parts.append(f"{months} month{'s' if months != 1 else ''}")
-    if remaining_days > 0 and years == 0:  # Only show days if less than a year
+    if remaining_days > 0 and years == 0:
         parts.append(f"{remaining_days} day{'s' if remaining_days != 1 else ''}")
     
     return ", ".join(parts) if parts else "Just started"
 
 def get_recent_activity(telegram_id: str) -> dict:
-    """Get activity stats for different time windows (for display only)"""
     db = get_db()
     try:
         now = datetime.utcnow()
-        
-        # Lifetime total
         lifetime = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).count()
         
-        # Last hour
         last_hour = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id,
             Conversation.timestamp >= now - timedelta(hours=1)
         ).count()
         
-        # Last 24 hours
         last_24h = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id,
             Conversation.timestamp >= now - timedelta(hours=24)
         ).count()
         
-        # Last 7 days
         last_7d = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id,
             Conversation.timestamp >= now - timedelta(days=7)
@@ -182,7 +192,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     activity = get_recent_activity(telegram_id)
     
     if memory["total_messages"] > 0:
-        # Returning user - emphasize lifetime memory
         welcome = (
             f"Welcome back {memory['user_name']}! 🎉\n\n"
             f"🧠 I have LIFETIME memory - I never forget!\n"
@@ -196,7 +205,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         welcome += "What would you like to discuss today?"
     else:
-        # Brand new user
         welcome = (
             "Hello! I'm your soccer assistant with LIFETIME memory! ⚽🧠\n\n"
             "I will remember every single conversation we have - forever. "
@@ -211,14 +219,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(user.id)
     current_message = update.message.text
     
-    # Get LIFETIME memory
     history = get_all_memory(telegram_id, max_messages=1000)
     memory = get_memory_summary(telegram_id)
     activity = get_recent_activity(telegram_id)
     
     current_lower = current_message.lower()
-    
-    # SMART RESPONSES WITH LIFETIME MEMORY
     
     if "remember" in current_lower or "recall" in current_lower:
         if memory["total_messages"] > 0:
@@ -292,49 +297,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif memory["years_together"] >= 5:
-        # Long-term relationship (5+ years)
         response = (
             f"Hey {memory['user_name']}! {memory['years_together']} YEARS together! 🎉\n"
             f"I'm practically your soccer historian now! What do you need?"
         )
     
     elif memory["years_together"] >= 1:
-        # Established relationship (1+ years)
         response = (
             f"Welcome back {memory['user_name']}! Year {memory['years_together']} of our soccer journey! "
             f"{memory['total_messages']} messages and counting. What's up?"
         )
     
     elif memory["months_together"] >= 6:
-        # 6+ months
         response = (
             f"Hey {memory['user_name']}! {memory['months_together']} months of soccer chats! "
             f"Building quite the archive together. What would you like to discuss?"
         )
     
     elif memory["total_messages"] > 10:
-        # Some history established
         response = (
             f"Welcome back {memory['user_name']}! {memory['total_messages']} messages in our lifetime archive. "
             f"What soccer topics shall we explore today?"
         )
     
     elif memory["total_messages"] > 0:
-        # Just started
         response = (
             f"Welcome back {memory['user_name']}! Message #{memory['total_messages'] + 1} in our lifetime memory. "
             f"What would you like to chat about?"
         )
     
     else:
-        # First message ever
         response = (
             "Hi! I'm your soccer assistant with LIFETIME memory! ⚽🧠\n\n"
             "This is the first message of our forever-archive. "
             "Ask me anything about soccer!"
         )
     
-    # SEND RESPONSE
     await update.message.reply_text(response)
     
     # SAVE TO LIFETIME MEMORY
@@ -348,7 +346,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         db.add(conv)
         
-        # Update user
         user_db = db.query(User).filter_by(telegram_id=telegram_id).first()
         if not user_db:
             user_db = User(
@@ -370,7 +367,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.close()
 
 async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to delete all user data (GDPR compliance)"""
+    """Admin command to delete all user data"""
     user = update.effective_user
     telegram_id = str(user.id)
     
@@ -380,9 +377,7 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db = get_db()
     try:
-        # Delete all conversations
         db.query(Conversation).filter_by(telegram_id=telegram_id).delete()
-        # Delete user record
         db.query(User).filter_by(telegram_id=telegram_id).delete()
         db.commit()
         await update.message.reply_text("All your data has been deleted. Start fresh!")
