@@ -7,7 +7,6 @@ import requests
 import secrets
 import string
 import re
-import hashlib
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
@@ -17,6 +16,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import enum
 import asyncio
+from functools import wraps
 
 # Setup logging
 logging.basicConfig(
@@ -42,7 +42,6 @@ class User(Base):
     last_active = Column(DateTime, default=datetime.utcnow)
     message_count = Column(Integer, default=0)
     is_authorized = Column(Boolean, default=False)
-    referral_code_used = Column(String, default=None)  # Track which code they used
 
 class Conversation(Base):
     __tablename__ = 'conversations'
@@ -62,9 +61,16 @@ class ReferralCode(Base):
     max_uses = Column(Integer, default=1)
     used_count = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
-    used_by = Column(Text, default="")  # Comma-separated list of user IDs
-    is_single_user = Column(Boolean, default=False)  # New: binds to first user
-    bound_user_id = Column(String, default=None)  # New: which user it's bound to
+    used_by = Column(Text, default="")
+
+class UnauthorizedAttempt(Base):
+    __tablename__ = 'unauthorized_attempts'
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(String, index=True)
+    username = Column(String)
+    first_name = Column(String)
+    message = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
 
 def get_database_url():
     DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///bot.db')
@@ -88,33 +94,6 @@ def init_db():
                 from sqlalchemy import text
                 try:
                     db.execute(text("ALTER TABLE users ADD COLUMN is_authorized BOOLEAN DEFAULT FALSE"))
-                    db.commit()
-                except:
-                    db.rollback()
-            if 'referral_code_used' not in columns:
-                logger.info("Adding referral_code_used column to users...")
-                from sqlalchemy import text
-                try:
-                    db.execute(text("ALTER TABLE users ADD COLUMN referral_code_used VARCHAR(50)"))
-                    db.commit()
-                except:
-                    db.rollback()
-        
-        if 'referral_codes' in inspector.get_table_names():
-            columns = [col['name'] for col in inspector.get_columns('referral_codes')]
-            if 'is_single_user' not in columns:
-                logger.info("Adding is_single_user column to referral_codes...")
-                from sqlalchemy import text
-                try:
-                    db.execute(text("ALTER TABLE referral_codes ADD COLUMN is_single_user BOOLEAN DEFAULT FALSE"))
-                    db.commit()
-                except:
-                    db.rollback()
-            if 'bound_user_id' not in columns:
-                logger.info("Adding bound_user_id column to referral_codes...")
-                from sqlalchemy import text
-                try:
-                    db.execute(text("ALTER TABLE referral_codes ADD COLUMN bound_user_id VARCHAR(50)"))
                     db.commit()
                 except:
                     db.rollback()
@@ -158,6 +137,72 @@ else:
 
 def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
+
+def is_user_authorized(telegram_id: str):
+    """Check if user is authorized"""
+    db = get_db()
+    try:
+        user = db.query(User).filter_by(telegram_id=telegram_id).first()
+        if user:
+            return user.is_authorized
+        return False
+    finally:
+        db.close()
+
+def log_unauthorized_attempt(telegram_id: str, username: str, first_name: str, message: str):
+    """Log attempts by unauthorized users"""
+    db = get_db()
+    try:
+        attempt = UnauthorizedAttempt(
+            telegram_id=str(telegram_id),
+            username=username or "",
+            first_name=first_name or "",
+            message=message[:500]  # Limit message length
+        )
+        db.add(attempt)
+        db.commit()
+        logger.warning(f"Unauthorized attempt by {first_name} (@{username}): {message[:100]}")
+    except Exception as e:
+        logger.error(f"Error logging unauthorized attempt: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+def require_auth(func):
+    """Decorator to require authorization"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        telegram_id = str(user.id)
+        
+        # Always allow admin
+        if check_admin(user.id):
+            return await func(update, context, *args, **kwargs)
+        
+        # Check if authorized
+        if not is_user_authorized(telegram_id):
+            # Log the attempt
+            log_unauthorized_attempt(
+                telegram_id, 
+                user.username, 
+                user.first_name, 
+                update.message.text if update.message else "N/A"
+            )
+            
+            # Send rejection message
+            await update.message.reply_text(
+                "⛔ **ACCESS DENIED**\n\n"
+                "This is a private bot. You need a valid referral code to use it.\n\n"
+                "🔑 To enter a code, type:\n`/code YOURCODE`\n\n"
+                "🎟️ Codes are given out by the admin only.\n"
+                "⏰ Codes expire after the set time period.\n\n"
+                "Contact @LearnWithLucky for access.",
+                parse_mode='Markdown'
+            )
+            return
+        
+        return await func(update, context, *args, **kwargs)
+    return wrapper
 
 def generate_referral_code(length=8):
     """Generate a random referral code"""
@@ -213,7 +258,7 @@ def format_duration(td: timedelta) -> str:
     else:
         return f"{days} day{'s' if days != 1 else ''}"
 
-def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1, is_single_user: bool = False):
+def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1):
     """Create a new time-based referral code"""
     db = get_db()
     try:
@@ -226,9 +271,7 @@ def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1, 
             expires_at=expires_at,
             max_uses=max_uses,
             used_count=0,
-            is_active=True,
-            is_single_user=is_single_user,
-            bound_user_id=None
+            is_active=True
         )
         db.add(ref_code)
         db.commit()
@@ -237,8 +280,7 @@ def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1, 
             "code": code,
             "expires_at": expires_at,
             "max_uses": max_uses,
-            "duration": duration,
-            "is_single_user": is_single_user
+            "duration": duration
         }
     except Exception as e:
         logger.error(f"Error creating referral code: {e}")
@@ -257,9 +299,6 @@ def validate_referral_code(code: str, user_id: str):
             return False, "Invalid code."
         
         if not ref.is_active:
-            # Check if it's a single-user code that's bound to someone else
-            if ref.is_single_user and ref.bound_user_id and ref.bound_user_id != user_id:
-                return False, "This code is already bound to another user and cannot be shared."
             return False, "This code has been deactivated."
         
         if datetime.utcnow() > ref.expires_at:
@@ -270,14 +309,9 @@ def validate_referral_code(code: str, user_id: str):
         if ref.used_count >= ref.max_uses:
             return False, "This code has reached its maximum uses."
         
-        # Check if user already used this code
         used_by_list = ref.used_by.split(",") if ref.used_by else []
         if user_id in used_by_list:
             return False, "You have already used this code."
-        
-        # For single-user codes, check if already bound to someone else
-        if ref.is_single_user and ref.bound_user_id and ref.bound_user_id != user_id:
-            return False, "This code is already bound to another user. Each code can only be used by one person."
         
         return True, "Code is valid!"
         
@@ -298,14 +332,6 @@ def use_referral_code(code: str, user_id: str):
             used_by_list.append(user_id)
             ref.used_by = ",".join(used_by_list)
             
-            # For single-user codes, bind to this user immediately
-            if ref.is_single_user:
-                ref.bound_user_id = user_id
-                # Keep is_active True but it's now bound, so others can't use it
-                # Actually, we should deactivate it after binding to prevent sharing
-                if ref.used_count >= 1:  # Once bound, disable for others
-                    ref.is_active = False
-            
             if ref.used_count >= ref.max_uses:
                 ref.is_active = False
             
@@ -319,15 +345,13 @@ def use_referral_code(code: str, user_id: str):
     finally:
         db.close()
 
-def authorize_user(telegram_id: str, code_used: str = None):
+def authorize_user(telegram_id: str):
     """Mark user as authorized"""
     db = get_db()
     try:
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
         if user:
             user.is_authorized = True
-            if code_used:
-                user.referral_code_used = code_used.upper()
             db.commit()
             return True
         return False
@@ -335,28 +359,6 @@ def authorize_user(telegram_id: str, code_used: str = None):
         logger.error(f"Error authorizing user: {e}")
         db.rollback()
         return False
-    finally:
-        db.close()
-
-def is_user_authorized(telegram_id: str):
-    """Check if user is authorized"""
-    db = get_db()
-    try:
-        user = db.query(User).filter_by(telegram_id=telegram_id).first()
-        if user:
-            return user.is_authorized
-        return False
-    finally:
-        db.close()
-
-def get_user_code(telegram_id: str):
-    """Get which code the user used (for checking if they can share)"""
-    db = get_db()
-    try:
-        user = db.query(User).filter_by(telegram_id=telegram_id).first()
-        if user:
-            return user.referral_code_used
-        return None
     finally:
         db.close()
 
@@ -480,14 +482,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     telegram_id = str(user.id)
     
+    # Check authorization
     authorized = is_user_authorized(telegram_id)
     
     if not authorized and not check_admin(user.id):
+        # Log this attempt
+        log_unauthorized_attempt(
+            telegram_id,
+            user.username,
+            user.first_name,
+            "Started bot without code"
+        )
+        
         await update.message.reply_text(
-            "👋 Welcome to the Soccer Bot!\n\n"
-            "This is a private bot. You need a referral code to access it.\n\n"
-            "Use /code YOURCODE to enter your referral code.\n"
-            "Codes expire after the set time period."
+            "👋 **Welcome to Learn With Lucky Soccer Bot**\n\n"
+            "🔒 This is a **private bot**. Access is by invitation only.\n\n"
+            "🎟️ **To join:**\n"
+            "1. Get a referral code from @LearnWithLucky\n"
+            "2. Type: `/code YOURCODE`\n\n"
+            "⏰ Codes expire after set time\n"
+            "👥 Limited uses per code\n\n"
+            "No code? Contact @LearnWithLucky for access.",
+            parse_mode='Markdown'
         )
         return
     
@@ -504,30 +520,45 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome)
 
 async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User enters referral code"""
+    """User enters referral code - NO auth required"""
     user = update.effective_user
     telegram_id = str(user.id)
     
     if not context.args:
         await update.message.reply_text(
-            "Please provide a code.\nExample: /code ABC12345"
+            "🔑 **Enter Referral Code**\n\n"
+            "Usage: `/code YOURCODE`\n\n"
+            "Example: `/code X7K9M2P4`",
+            parse_mode='Markdown'
         )
         return
     
     code = context.args[0].upper()
     user_id_str = str(telegram_id)
     
+    # Check if already authorized
     if is_user_authorized(telegram_id):
-        await update.message.reply_text("You're already authorized! Enjoy the bot! ⚽")
+        await update.message.reply_text("✅ You're already authorized! Enjoy the bot! ⚽")
         return
     
+    # Validate code
     is_valid, message = validate_referral_code(code, user_id_str)
     
     if not is_valid:
-        await update.message.reply_text(f"❌ {message}")
+        # Log failed attempt
+        log_unauthorized_attempt(
+            telegram_id,
+            user.username,
+            user.first_name,
+            f"Failed code attempt: {code}"
+        )
+        
+        await update.message.reply_text(f"❌ **{message}**\n\nTry again or contact @LearnWithLucky for a valid code.", parse_mode='Markdown')
         return
     
+    # Use the code
     if use_referral_code(code, user_id_str):
+        # Create or update user
         db = get_db()
         try:
             user_db = db.query(User).filter_by(telegram_id=telegram_id).first()
@@ -537,128 +568,103 @@ async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     username=user.username,
                     first_name=user.first_name,
                     role=UserRole.ADMIN if check_admin(user.id) else UserRole.USER,
-                    is_authorized=True,
-                    referral_code_used=code
+                    is_authorized=True
                 )
                 db.add(user_db)
             else:
                 user_db.is_authorized = True
-                user_db.referral_code_used = code
             
             db.commit()
             
-            # Check if this was a single-user code
-            ref = db.query(ReferralCode).filter_by(code=code).first()
-            if ref and ref.is_single_user:
-                await update.message.reply_text(
-                    "✅ Code accepted! You're now authorized.\n\n"
-                    "⚠️ This code is bound to you only and cannot be shared with others.\n\n"
-                    "Welcome to Soccer Bot! Ask me anything about soccer. ⚽"
-                )
-            else:
-                await update.message.reply_text(
-                    "✅ Code accepted! You're now authorized.\n\n"
-                    "Welcome to Soccer Bot! Ask me anything about soccer. ⚽"
-                )
+            await update.message.reply_text(
+                "✅ **Access Granted!**\n\n"
+                "Welcome to the Soccer Bot! 🎉⚽\n\n"
+                "I remember every conversation we have. Ask me anything about:\n"
+                "• Formations & tactics\n"
+                "• Players & teams\n"
+                "• Training & drills\n"
+                "• Match analysis\n\n"
+                "What would you like to talk about?"
+            )
             
         except Exception as e:
             logger.error(f"Error creating user: {e}")
             db.rollback()
-            await update.message.reply_text("Error processing code. Please try again.")
+            await update.message.reply_text("❌ Error processing code. Please try again.")
         finally:
             db.close()
     else:
         await update.message.reply_text("❌ Error processing code. Please try again.")
 
+@require_auth
 async def generate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to generate referral code with flexible duration"""
+    """Admin command to generate referral code - REQUIRES AUTH"""
     user = update.effective_user
     
     if not check_admin(user.id):
-        await update.message.reply_text("This command is only for admins.")
+        await update.message.reply_text("⛔ This command is only for admins.")
         return
     
-    # Parse arguments: /gencode [duration] [uses] [single]
+    # Parse arguments: /gencode [duration] [uses]
     duration_str = "24h"
     max_uses = 1
-    is_single_user = False
     
     if context.args:
-        # Check for flags
-        args_copy = context.args.copy()
+        first_arg = context.args[0]
         
-        # Check for 'single' flag
-        if 'single' in args_copy:
-            is_single_user = True
-            args_copy.remove('single')
-        
-        # Now parse remaining args
-        if args_copy:
-            first_arg = args_copy[0]
-            
-            if any(c.isalpha() for c in first_arg):
-                duration_str = first_arg
-                if len(args_copy) > 1:
-                    try:
-                        max_uses = int(args_copy[1])
-                    except ValueError:
-                        pass
-            else:
+        if any(c.isalpha() for c in first_arg):
+            duration_str = first_arg
+            if len(context.args) > 1:
                 try:
-                    hours = int(first_arg)
-                    duration_str = f"{hours}h"
-                    if len(args_copy) > 1:
-                        max_uses = int(args_copy[1])
+                    max_uses = int(context.args[1])
                 except ValueError:
-                    await update.message.reply_text(
-                        "Usage: /gencode [duration] [max_uses] [single]\n"
-                        "Examples:\n"
-                        "/gencode 1m (1 month, 1 use)\n"
-                        "/gencode 3m 5 (3 months, 5 uses)\n"
-                        "/gencode 6m single (6 months, single-user code)\n"
-                        "/gencode 12m 1 single (12 months, 1 use, single-user)\n"
-                        "/gencode 1y single (1 year, binds to first user)"
-                    )
-                    return
+                    pass
+        else:
+            try:
+                hours = int(first_arg)
+                duration_str = f"{hours}h"
+                if len(context.args) > 1:
+                    max_uses = int(context.args[1])
+            except ValueError:
+                await update.message.reply_text(
+                    "📋 **Usage:**\n"
+                    "`/gencode [duration] [uses]`\n\n"
+                    "**Examples:**\n"
+                    "`/gencode 1m` (1 month, 1 use)\n"
+                    "`/gencode 3m 5` (3 months, 5 uses)\n"
+                    "`/gencode 6m 10` (6 months, 10 uses)\n"
+                    "`/gencode 12m` (12 months)\n"
+                    "`/gencode 1y` (1 year)",
+                    parse_mode='Markdown'
+                )
+                return
     
-    # Parse duration
     duration = parse_duration(duration_str)
-    
-    # For single-user codes, force max_uses to 1
-    if is_single_user:
-        max_uses = 1
-    
-    result = create_referral_code(str(user.id), duration, max_uses, is_single_user)
+    result = create_referral_code(str(user.id), duration, max_uses)
     
     if result:
-        expires_str = result['expires_at'].strftime("%B %d, %Y at %H:%M UTC")
+        expires_str = result['expires_at'].strftime("%B %d, %Y")
         duration_readable = format_duration(result['duration'])
         
-        code_type = "🔒 SINGLE-USER" if result['is_single_user'] else "🎟️ Standard"
-        
-        single_user_warning = ""
-        if result['is_single_user']:
-            single_user_warning = "\n⚠️ This code will bind to the FIRST user only and cannot be shared!"
-        
         await update.message.reply_text(
-            f"{code_type} Referral Code Generated!\n\n"
+            f"🎟️ **Referral Code Generated**\n\n"
             f"Code: `{result['code']}`\n"
             f"Duration: {duration_readable}\n"
             f"Expires: {expires_str}\n"
-            f"Max uses: {result['max_uses']}\n"
-            f"Type: {'Single-user (non-transferable)' if result['is_single_user'] else 'Multi-user'}{single_user_warning}\n\n"
-            f"Share this code with friends. They have {duration_readable} to use it!",
+            f"Max uses: {result['max_uses']}\n\n"
+            f"Share this code with friends!",
             parse_mode='Markdown'
         )
     else:
-        await update.message.reply_text("Error generating code. Please try again.")
+        await update.message.reply_text("❌ Error generating code. Please try again.")
 
+@require_auth
 async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to list active codes"""
+    """Admin command to list active codes - REQUIRES AUTH"""
     user = update.effective_user
     
     if not check_admin(user.id):
-        await update.message.reply_text("This command is only for admins.")
+        await update.message.reply_text("⛔ This command is only for admins.")
         return
     
     db = get_db()
@@ -666,10 +672,10 @@ async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         codes = db.query(ReferralCode).filter_by(is_active=True).all()
         
         if not codes:
-            await update.message.reply_text("No active referral codes.")
+            await update.message.reply_text("📭 No active referral codes.")
             return
         
-        message = "🎟️ Active Referral Codes:\n\n"
+        message = "🎟️ **Active Referral Codes:**\n\n"
         for code in codes:
             expires_in = code.expires_at - datetime.utcnow()
             hours_left = int(expires_in.total_seconds() / 3600)
@@ -677,42 +683,34 @@ async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             if days_left > 30:
                 months_left = days_left // 30
-                time_left = f"{months_left} month{'s' if months_left != 1 else ''}"
+                time_left = f"{months_left}mo"
             elif days_left > 0:
-                time_left = f"{days_left} day{'s' if days_left != 1 else ''}"
+                time_left = f"{days_left}d"
             else:
-                time_left = f"{hours_left} hour{'s' if hours_left != 1 else ''}"
+                time_left = f"{hours_left}h"
             
-            status = "⏰ Expires soon" if hours_left < 24 else "✅ Active"
-            code_type = "🔒" if code.is_single_user else "🎟️"
+            status = "⏰" if hours_left < 24 else "✅"
             
             message += (
-                f"{code_type} Code: `{code.code}`\n"
-                f"Uses: {code.used_count}/{code.max_uses}\n"
-                f"Expires in: {time_left}\n"
-                f"Status: {status}\n"
-                f"{'Bound to: ' + code.bound_user_id[:8] + '...' if code.bound_user_id else ''}\n\n"
+                f"{status} `{code.code}` | "
+                f"Uses: {code.used_count}/{code.max_uses} | "
+                f"Expires: {time_left}\n"
             )
         
         await update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
         logger.error(f"Error listing codes: {e}")
-        await update.message.reply_text("Error retrieving codes.")
+        await update.message.reply_text("❌ Error retrieving codes.")
     finally:
         db.close()
 
+@require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle messages - REQUIRES AUTH"""
     user = update.effective_user
     telegram_id = str(user.id)
     current_message = update.message.text
-    
-    if not is_user_authorized(telegram_id) and not check_admin(user.id):
-        await update.message.reply_text(
-            "⛔ You need a referral code to use this bot.\n"
-            "Use /code YOURCODE to enter your code."
-        )
-        return
     
     history = get_recent_memory(telegram_id, max_messages=6)
     memory = get_memory_summary(telegram_id)
@@ -795,13 +793,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         db.close()
 
+@require_auth
 async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to delete all user data"""
+    """Admin command to delete all user data - REQUIRES AUTH"""
     user = update.effective_user
     telegram_id = str(user.id)
     
     if not check_admin(user.id):
-        await update.message.reply_text("This command is only available to admins.")
+        await update.message.reply_text("⛔ This command is only for admins.")
         return
     
     db = get_db()
@@ -809,11 +808,11 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.query(Conversation).filter_by(telegram_id=telegram_id).delete()
         db.query(User).filter_by(telegram_id=telegram_id).delete()
         db.commit()
-        await update.message.reply_text("All your data has been deleted. Start fresh!")
+        await update.message.reply_text("🗑️ All your data has been deleted. Start fresh!")
     except Exception as e:
         logger.error(f"Error deleting data: {e}")
         db.rollback()
-        await update.message.reply_text("Error deleting data.")
+        await update.message.reply_text("❌ Error deleting data.")
     finally:
         db.close()
 
@@ -851,7 +850,8 @@ def main():
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("Bot running with single-user referral codes!")
+    logger.info("🔒 Bot running with STRICT authorization!")
+    logger.info("Only users with valid codes can access.")
     
     if RAILWAY_STATIC_URL:
         webhook_url = f"{RAILWAY_STATIC_URL}/webhook"
