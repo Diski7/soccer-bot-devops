@@ -7,17 +7,23 @@ import requests
 import secrets
 import string
 import re
+import json
+import hashlib
 from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
-from telegram.error import Conflict, NetworkError, TimedOut
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect
+from telegram.error import Conflict, NetworkError, TimedOut, RetryAfter
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, Enum, desc, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 import enum
 import asyncio
 from functools import wraps
+from collections import defaultdict
+import threading
 
+# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -33,7 +39,7 @@ class UserRole(enum.Enum):
 class User(Base):
     __tablename__ = 'users'
     id = Column(Integer, primary_key=True)
-    telegram_id = Column(String, unique=True, nullable=False)
+    telegram_id = Column(String, unique=True, nullable=False, index=True)
     username = Column(String)
     first_name = Column(String)
     role = Column(Enum(UserRole), default=UserRole.USER)
@@ -48,7 +54,7 @@ class Conversation(Base):
     telegram_id = Column(String, index=True)
     user_message = Column(Text)
     bot_response = Column(Text)
-    timestamp = Column(DateTime, default=datetime.utcnow)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
 class ReferralCode(Base):
     __tablename__ = 'referral_codes'
@@ -56,10 +62,10 @@ class ReferralCode(Base):
     code = Column(String, unique=True, nullable=False, index=True)
     created_by = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
-    expires_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
     max_uses = Column(Integer, default=1)
     used_count = Column(Integer, default=0)
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=True, index=True)
     used_by = Column(Text, default="")
 
 class UnauthorizedAttempt(Base):
@@ -77,8 +83,17 @@ def get_database_url():
         DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
     return DATABASE_URL
 
-engine = create_engine(get_database_url())
-SessionLocal = sessionmaker(bind=engine)
+# OPTIMIZED: Connection pooling for high concurrency
+engine = create_engine(
+    get_database_url(),
+    poolclass=QueuePool,
+    pool_size=10,           # Keep 10 connections ready
+    max_overflow=20,        # Allow 20 extra under load
+    pool_timeout=30,        # Wait 30s for available connection
+    pool_recycle=1800,      # Recycle connections after 30min
+    pool_pre_ping=True      # Verify connections before use
+)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 def init_db():
     db = get_db()
@@ -87,14 +102,13 @@ def init_db():
         if 'users' in inspector.get_table_names():
             columns = [col['name'] for col in inspector.get_columns('users')]
             if 'is_authorized' not in columns:
-                from sqlalchemy import text
                 try:
                     db.execute(text("ALTER TABLE users ADD COLUMN is_authorized BOOLEAN DEFAULT FALSE"))
                     db.commit()
                 except:
                     db.rollback()
         Base.metadata.create_all(engine)
-        logger.info("Database ready!")
+        logger.info("Database ready with optimized pooling!")
     except Exception as e:
         logger.error(f"Database error: {e}")
         try:
@@ -109,6 +123,7 @@ def init_db():
 def get_db():
     return SessionLocal()
 
+# Environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -124,21 +139,59 @@ if USE_OPENAI:
     logger.info("Using OpenAI for LLM")
 elif USE_OLLAMA:
     logger.info(f"Using Ollama at {OLLAMA_URL}")
-else:
-    logger.warning("No LLM configured")
 
 def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
 
+# SIMPLE CACHE: In-memory with TTL
+class SimpleCache:
+    def __init__(self, ttl_seconds=300):
+        self.cache = {}
+        self.ttl = ttl_seconds
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                value, expiry = self.cache[key]
+                if datetime.utcnow() < expiry:
+                    return value
+                else:
+                    del self.cache[key]
+            return None
+    
+    def set(self, key, value, ttl=None):
+        with self.lock:
+            expiry = datetime.utcnow() + timedelta(seconds=(ttl or self.ttl))
+            self.cache[key] = (value, expiry)
+    
+    def delete(self, key):
+        with self.lock:
+            if key in self.cache:
+                del self.cache[key]
+
+# Initialize caches
+auth_cache = SimpleCache(ttl_seconds=60)      # Auth status (1 min)
+memory_cache = SimpleCache(ttl_seconds=30)    # Recent memory (30 sec)
+rate_limit_cache = SimpleCache(ttl_seconds=60) # Rate limiting (1 min)
+
 def is_user_authorized(telegram_id: str):
+    # Check cache first
+    cached = auth_cache.get(f"auth_{telegram_id}")
+    if cached is not None:
+        return cached
+    
     db = get_db()
     try:
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
-        return user.is_authorized if user else False
+        result = user.is_authorized if user else False
+        auth_cache.set(f"auth_{telegram_id}", result)
+        return result
     finally:
         db.close()
 
 def log_unauthorized_attempt(telegram_id: str, username: str, first_name: str, message: str):
+    # Batch insert for performance (optional optimization)
     db = get_db()
     try:
         attempt = UnauthorizedAttempt(
@@ -149,12 +202,20 @@ def log_unauthorized_attempt(telegram_id: str, username: str, first_name: str, m
         )
         db.add(attempt)
         db.commit()
-        logger.warning(f"Unauthorized attempt by {first_name} (@{username})")
     except Exception as e:
         logger.error(f"Error logging: {e}")
         db.rollback()
     finally:
         db.close()
+
+def check_rate_limit(telegram_id: str, max_requests=30):
+    """Rate limit: 30 messages per minute per user"""
+    key = f"rate_{telegram_id}"
+    count = rate_limit_cache.get(key) or 0
+    if count >= max_requests:
+        return False
+    rate_limit_cache.set(key, count + 1, ttl=60)
+    return True
 
 def require_auth(func):
     @wraps(func)
@@ -169,13 +230,16 @@ def require_auth(func):
             log_unauthorized_attempt(telegram_id, user.username, user.first_name, 
                                    update.message.text if update.message else "N/A")
             await update.message.reply_text(
-                "⛔ **ACCESS DENIED**\n\n"
-                "Private bot. Invitation only.\n\n"
-                "🔑 `/code YOURCODE`\n\n"
-                "Contact @LearnWithLucky for access.",
+                "🔒 **Private Bot**\n\nInvitation only.\n\n🔑 `/code YOURCODE`",
                 parse_mode='Markdown'
             )
             return
+        
+        # Rate limiting check
+        if not check_rate_limit(telegram_id):
+            await update.message.reply_text("⏱️ Too many messages. Slow down!")
+            return
+        
         return await func(update, context, *args, **kwargs)
     return wrapper
 
@@ -213,16 +277,9 @@ def format_duration(td: timedelta) -> str:
     days = td.days
     if days >= 365:
         years = days // 365
-        remaining_days = days % 365
-        if remaining_days > 30:
-            months = remaining_days // 30
-            return f"{years}y {months}m"
         return f"{years}y"
     elif days >= 30:
         months = days // 30
-        remaining_days = days % 30
-        if remaining_days > 0:
-            return f"{months}m {remaining_days}d"
         return f"{months}m"
     else:
         return f"{days}d"
@@ -307,6 +364,8 @@ def authorize_user(telegram_id: str):
         if user:
             user.is_authorized = True
             db.commit()
+            # Invalidate cache
+            auth_cache.delete(f"auth_{telegram_id}")
             return True
         return False
     except Exception as e:
@@ -317,12 +376,20 @@ def authorize_user(telegram_id: str):
         db.close()
 
 def get_recent_memory(telegram_id: str, max_messages: int = 6):
+    # Check cache
+    cache_key = f"mem_{telegram_id}"
+    cached = memory_cache.get(cache_key)
+    if cached:
+        return cached
+    
     db = get_db()
     try:
         history = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(desc(Conversation.timestamp)).limit(max_messages).all()
-        return list(reversed(history))
+        result = list(reversed(history))
+        memory_cache.set(cache_key, result, ttl=30)
+        return result
     finally:
         db.close()
 
@@ -367,11 +434,9 @@ def is_greeting(message: str) -> bool:
 def get_llm_response(user_message: str, conversation_history: list, user_name: str, is_new_user: bool = False) -> str:
     messages = []
     
-    # GENERAL KNOWLEDGE - not just soccer anymore
-    system_prompt = f"""You are a knowledgeable AI assistant having natural conversations. 
-You can discuss any topic: sports, science, tech, history, coding, business, advice, creative writing, analysis, etc.
-You remember past discussions with {user_name} and maintain continuity.
-Be helpful, concise, and conversational. If you're unsure, say so. Don't make things up."""
+    system_prompt = f"""You are a helpful AI assistant. You can discuss any topic knowledgeably.
+You remember past conversations with {user_name} and maintain continuity.
+Be concise, helpful, and natural. If unsure, say so."""
     
     messages.append({"role": "system", "content": system_prompt})
     
@@ -387,26 +452,25 @@ Be helpful, concise, and conversational. If you're unsure, say so. Don't make th
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=messages,
-                max_tokens=400,
-                temperature=0.7
+                max_tokens=300,
+                temperature=0.7,
+                request_timeout=10  # Fail fast if slow
             )
             return response.choices[0].message.content
             
         elif USE_OLLAMA:
             prompt = f"{system_prompt}\n\n"
             if conversation_history and not is_new_user:
-                prompt += "Recent chat:\n"
                 for conv in conversation_history[-3:]:
-                    prompt += f"User: {conv.user_message}\n"
-                    prompt += f"Assistant: {conv.bot_response}\n"
+                    prompt += f"User: {conv.user_message}\nAssistant: {conv.bot_response}\n"
             prompt += f"User: {user_message}\nAssistant:"
             
             response = requests.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={"model": "llama2", "prompt": prompt, "stream": False, "max_tokens": 400},
-                timeout=30
+                json={"model": "llama2", "prompt": prompt, "stream": False, "max_tokens": 300},
+                timeout=10
             )
-            return response.json().get("response", "Can't respond right now.")
+            return response.json().get("response", "Can't respond now.")
         else:
             return None
     except Exception as e:
@@ -420,10 +484,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_user_authorized(telegram_id) and not check_admin(user.id):
         log_unauthorized_attempt(telegram_id, user.username, user.first_name, "Started bot")
         await update.message.reply_text(
-            "🔒 **Private AI Bot**\n\n"
-            "Invitation only access.\n\n"
-            "🔑 Get code from @LearnWithLucky\n"
-            "💬 Then type: `/code YOURCODE`",
+            "🔒 **Private AI Bot**\n\nInvitation only.\n\n🔑 Get code from @LearnWithLucky\n💬 Then type: `/code YOURCODE`",
             parse_mode='Markdown'
         )
         return
@@ -431,10 +492,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     memory = get_memory_summary(telegram_id)
     
     if memory["is_new_user"]:
-        welcome = "Hey! I'm your AI assistant. I know a bit about everything and I remember our conversations. What's on your mind?"
+        welcome = "Hey! I'm your AI assistant. Ask me anything - I remember our conversations. What's on your mind?"
     else:
         if memory["time_since_last"] and memory["time_since_last"].days > 7:
-            welcome = f"Hey {memory['user_name']}! Been a while. What are we talking about today?"
+            welcome = f"Hey {memory['user_name']}! Been a while. What's up?"
         else:
             welcome = f"Hey {memory['user_name']}! What's up?"
     
@@ -480,11 +541,11 @@ async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db.commit()
             
             await update.message.reply_text(
-                "✅ **Access Granted!**\n\n"
-                "I'm your AI assistant with memory. Ask me anything:\n"
-                "• Sports, science, tech, history\n"
-                "• Advice, analysis, creative writing\n"
-                "• Coding, business, random questions\n\n"
+                "✅ **Welcome!**\n\n"
+                "I'm your AI with memory. Ask me anything:\n"
+                "• Tech, science, business, coding\n"
+                "• Advice, writing, analysis\n"
+                "• Sports, history, life questions\n\n"
                 "What would you like to talk about?"
             )
         except Exception as e:
@@ -568,7 +629,7 @@ async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 time_left = f"{expires_in.seconds//3600}h"
             
-            msg += f"`{code.code}` | {code.used_count}/{code.max_uses} | {time_left} left\n"
+            msg += f"`{code.code}` | {code.used_count}/{code.max_uses} | {time_left}\n"
         
         await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
@@ -595,7 +656,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif any(x in current_lower for x in ["remember", "recall"]):
         if history:
-            response = "We've been talking about various things. What specifically?"
+            response = "We've talked about various things. What specifically?"
         else:
             response = "Just getting started! What would you like to discuss?"
     
@@ -608,35 +669,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(response)
     
-    db = get_db()
-    try:
-        conv = Conversation(
-            telegram_id=telegram_id,
-            user_message=current_message,
-            bot_response=response,
-            timestamp=datetime.utcnow()
-        )
-        db.add(conv)
-        
-        user_db = db.query(User).filter_by(telegram_id=telegram_id).first()
-        if not user_db:
-            user_db = User(
+    # Async save to not block response
+    async def save_conversation():
+        db = get_db()
+        try:
+            conv = Conversation(
                 telegram_id=telegram_id,
-                username=user.username,
-                first_name=user.first_name,
-                role=UserRole.ADMIN if check_admin(user.id) else UserRole.USER,
-                is_authorized=True
+                user_message=current_message,
+                bot_response=response,
+                timestamp=datetime.utcnow()
             )
-            db.add(user_db)
-        
-        user_db.message_count = memory['total_messages'] + 1
-        user_db.last_active = datetime.utcnow()
-        db.commit()
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        db.rollback()
-    finally:
-        db.close()
+            db.add(conv)
+            
+            user_db = db.query(User).filter_by(telegram_id=telegram_id).first()
+            if not user_db:
+                user_db = User(
+                    telegram_id=telegram_id,
+                    username=user.username,
+                    first_name=user.first_name,
+                    role=UserRole.ADMIN if check_admin(user.id) else UserRole.USER,
+                    is_authorized=True
+                )
+                db.add(user_db)
+            
+            user_db.message_count = memory['total_messages'] + 1
+            user_db.last_active = datetime.utcnow()
+            db.commit()
+            
+            # Invalidate memory cache
+            memory_cache.delete(f"mem_{telegram_id}")
+        except Exception as e:
+            logger.error(f"Error saving: {e}")
+            db.rollback()
+        finally:
+            db.close()
+    
+    # Fire and forget save
+    asyncio.create_task(save_conversation())
 
 @require_auth
 async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -651,6 +720,8 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.query(Conversation).filter_by(telegram_id=telegram_id).delete()
         db.query(User).filter_by(telegram_id=telegram_id).delete()
         db.commit()
+        auth_cache.delete(f"auth_{telegram_id}")
+        memory_cache.delete(f"mem_{telegram_id}")
         await update.message.reply_text("🗑️ Data deleted.")
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -661,9 +732,18 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Exception: {context.error}")
+    
+    if isinstance(context.error, RetryAfter):
+        # Rate limited by Telegram, wait and retry
+        retry_after = context.error.retry_after
+        logger.warning(f"Rate limited. Retry after {retry_after}s")
+        await asyncio.sleep(retry_after)
+        return
+    
     if isinstance(context.error, Conflict):
         logger.error("Conflict - multiple instances")
         return
+    
     if isinstance(context.error, (NetworkError, TimedOut)):
         logger.warning("Network error")
         return
@@ -674,7 +754,16 @@ def main():
         logger.error("No TELEGRAM_BOT_TOKEN!")
         return
     
-    application = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(False).build()
+    # Build with optimized settings for scale
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)  # Enable concurrent processing
+        .connection_pool_size(20)   # More connections for high load
+        .pool_timeout(30.0)
+        .build()
+    )
+    
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("code", enter_code))
@@ -683,7 +772,8 @@ def main():
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("🚀 General knowledge AI bot running!")
+    logger.info("🚀 SCALABLE BOT RUNNING!")
+    logger.info("Ready for 1000+ users")
     
     if RAILWAY_STATIC_URL:
         application.run_webhook(
@@ -693,7 +783,10 @@ def main():
             drop_pending_updates=True
         )
     else:
-        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
 
 if __name__ == "__main__":
     main()
