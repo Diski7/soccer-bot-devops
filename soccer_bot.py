@@ -108,8 +108,8 @@ else:
 def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
 
-def get_all_memory(telegram_id: str, max_messages: int = 20):
-    """Fetch recent conversations for context"""
+def get_recent_memory(telegram_id: str, max_messages: int = 6):
+    """Fetch only recent conversations for context"""
     db = get_db()
     try:
         history = db.query(Conversation).filter(
@@ -120,7 +120,7 @@ def get_all_memory(telegram_id: str, max_messages: int = 20):
         db.close()
 
 def get_memory_summary(telegram_id: str):
-    """Create summary of entire lifetime relationship"""
+    """Get minimal summary"""
     db = get_db()
     try:
         total_convos = db.query(Conversation).filter(
@@ -137,127 +137,88 @@ def get_memory_summary(telegram_id: str):
         
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
         
-        if first_convo:
-            time_since_first = datetime.utcnow() - first_convo.timestamp
-            days_together = time_since_first.days
-            years_together = days_together // 365
-            months_together = (days_together % 365) // 30
-        else:
-            days_together = 0
-            years_together = 0
-            months_together = 0
-            time_since_first = timedelta(0)
-            
+        time_since_last = None
+        if last_convo:
+            time_since_last = datetime.utcnow() - last_convo.timestamp
+        
         return {
             "total_messages": total_convos,
-            "first_chat": first_convo.timestamp.strftime("%B %d, %Y at %H:%M") if first_convo else "Today",
-            "last_chat": last_convo.timestamp.strftime("%B %d, %Y at %H:%M") if last_convo else "Never",
+            "first_chat": first_convo.timestamp if first_convo else None,
+            "last_chat": last_convo.timestamp if last_convo else None,
             "user_name": user.first_name if user else "Friend",
-            "days_together": days_together,
-            "years_together": years_together,
-            "months_together": months_together,
-            "time_since_first": format_duration(time_since_first) if first_convo else "Just now"
+            "time_since_last": time_since_last,
+            "is_new_user": total_convos == 0
         }
     finally:
         db.close()
 
-def format_duration(td: timedelta) -> str:
-    days = td.days
-    years = days // 365
-    months = (days % 365) // 30
-    remaining_days = days % 30
-    
-    parts = []
-    if years > 0:
-        parts.append(f"{years} year{'s' if years != 1 else ''}")
-    if months > 0:
-        parts.append(f"{months} month{'s' if months != 1 else ''}")
-    if remaining_days > 0 and years == 0:
-        parts.append(f"{remaining_days} day{'s' if remaining_days != 1 else ''}")
-    
-    return ", ".join(parts) if parts else "Just started"
+def is_greeting(message: str) -> bool:
+    """Check if message is a greeting"""
+    greetings = [
+        "hi", "hello", "hey", "greetings", "good morning", 
+        "good afternoon", "good evening", "yo", "sup", "what's up",
+        "howdy", "hi there", "hello there", "hey there"
+    ]
+    msg_lower = message.lower().strip()
+    # Check if message is exactly a greeting or starts with one
+    for greeting in greetings:
+        if msg_lower == greeting or msg_lower.startswith(greeting + " "):
+            return True
+    return False
 
-def get_recent_activity(telegram_id: str) -> dict:
-    db = get_db()
-    try:
-        now = datetime.utcnow()
-        lifetime = db.query(Conversation).filter(
-            Conversation.telegram_id == telegram_id
-        ).count()
-        
-        last_hour = db.query(Conversation).filter(
-            Conversation.telegram_id == telegram_id,
-            Conversation.timestamp >= now - timedelta(hours=1)
-        ).count()
-        
-        last_24h = db.query(Conversation).filter(
-            Conversation.telegram_id == telegram_id,
-            Conversation.timestamp >= now - timedelta(hours=24)
-        ).count()
-        
-        last_7d = db.query(Conversation).filter(
-            Conversation.telegram_id == telegram_id,
-            Conversation.timestamp >= now - timedelta(days=7)
-        ).count()
-        
-        return {
-            "lifetime": lifetime,
-            "last_hour": last_hour,
-            "last_24h": last_24h,
-            "last_7d": last_7d
-        }
-    finally:
-        db.close()
-
-def get_llm_response(user_message: str, conversation_history: list, memory_summary: dict) -> str:
-    """Get response from LLM with memory context"""
+def get_llm_response(user_message: str, conversation_history: list, user_name: str, is_new_user: bool = False) -> str:
+    """Get natural response from LLM"""
     
-    # Build conversation context from memory
-    context = "You are a knowledgeable soccer assistant with LIFETIME memory. You remember all past conversations with this user.\n\n"
+    messages = []
     
-    if memory_summary["total_messages"] > 0:
-        context += f"User: {memory_summary['user_name']}\n"
-        context += f"Relationship: {memory_summary['time_since_first']}\n"
-        context += f"Total messages: {memory_summary['total_messages']}\n\n"
+    system_prompt = """You are a knowledgeable soccer assistant having a natural conversation. 
+You remember past discussions but speak casually like a friend. 
+Don't summarize conversation history unless asked. 
+Just respond to the current question while maintaining context from previous messages.
+Be concise, friendly, and soccer-focused."""
+    
+    messages.append({"role": "system", "content": system_prompt})
     
     # Add recent conversation history
-    if conversation_history:
-        context += "Recent conversation history:\n"
-        for conv in conversation_history[-10:]:  # Last 10 messages
-            context += f"User: {conv.user_message}\n"
-            context += f"Assistant: {conv.bot_response}\n\n"
+    if conversation_history and not is_new_user:
+        for conv in conversation_history[-3:]:
+            messages.append({"role": "user", "content": conv.user_message})
+            messages.append({"role": "assistant", "content": conv.bot_response})
     
-    context += f"Current user message: {user_message}\n\n"
-    context += "Respond as a helpful soccer expert. Be conversational and reference previous discussions if relevant."
+    messages.append({"role": "user", "content": user_message})
     
     try:
         if USE_OPENAI:
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful soccer assistant with perfect memory of all past conversations."},
-                    {"role": "user", "content": context}
-                ],
-                max_tokens=500,
+                messages=messages,
+                max_tokens=300,
                 temperature=0.7
             )
             return response.choices[0].message.content
             
         elif USE_OLLAMA:
+            prompt = f"{system_prompt}\n\n"
+            if conversation_history and not is_new_user:
+                prompt += "Recent conversation:\n"
+                for conv in conversation_history[-3:]:
+                    prompt += f"User: {conv.user_message}\n"
+                    prompt += f"Assistant: {conv.bot_response}\n"
+            prompt += f"User: {user_message}\nAssistant:"
+            
             response = requests.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={
                     "model": "llama2",
-                    "prompt": context,
+                    "prompt": prompt,
                     "stream": False,
-                    "max_tokens": 500
+                    "max_tokens": 300
                 },
                 timeout=30
             )
             return response.json().get("response", "I couldn't generate a response right now.")
         
         else:
-            # Fallback without LLM
             return None
             
     except Exception as e:
@@ -269,27 +230,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(user.id)
     
     memory = get_memory_summary(telegram_id)
-    activity = get_recent_activity(telegram_id)
     
-    if memory["total_messages"] > 0:
-        welcome = (
-            f"Welcome back {memory['user_name']}! 🎉\n\n"
-            f"🧠 I have LIFETIME memory - I never forget!\n"
-            f"📅 We've been chatting for: {memory['time_since_first']}\n"
-            f"💬 Total messages: {memory['total_messages']}\n"
-            f"🎂 First chat: {memory['first_chat']}\n\n"
-        )
-        
-        if memory["years_together"] >= 1:
-            welcome += f"🎉 Happy {memory['years_together']}-year anniversary! 🎂\n\n"
-        
-        welcome += "Ask me anything about soccer!"
+    if memory["is_new_user"]:
+        welcome = "Hey! I'm your soccer buddy. Ask me anything about the beautiful game! ⚽"
     else:
-        welcome = (
-            "Hello! I'm your soccer assistant with LIFETIME memory! ⚽🧠\n\n"
-            "I will remember every single conversation we have - forever. "
-            "Ask me anything about soccer, formations, tactics, players, or matches!"
-        )
+        if memory["time_since_last"] and memory["time_since_last"].days > 7:
+            welcome = f"Hey {memory['user_name']}! Long time no see. What's on your mind about soccer?"
+        else:
+            welcome = f"Hey {memory['user_name']}! What's up?"
     
     await update.message.reply_text(welcome)
 
@@ -298,61 +246,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(user.id)
     current_message = update.message.text
     
-    # Get memory
-    history = get_all_memory(telegram_id, max_messages=20)
+    history = get_recent_memory(telegram_id, max_messages=6)
     memory = get_memory_summary(telegram_id)
-    activity = get_recent_activity(telegram_id)
     
     current_lower = current_message.lower()
     
-    # Check for memory-related commands first
-    if "remember" in current_lower or "recall" in current_lower:
-        response = (
-            f"Of course! I have LIFETIME memory 🧠\n\n"
-            f"📅 We've known each other for {memory['time_since_first']}\n"
-            f"💬 {memory['total_messages']} total messages\n"
-            f"🎂 Since: {memory['first_chat']}\n\n"
-            f"I remember every single conversation. What soccer topic would you like to discuss?"
-        )
+    # Check if it's a greeting first
+    if is_greeting(current_message):
+        response = "Hi, how may I assist you?"
     
-    elif "how long" in current_lower or "history" in current_lower:
-        response = (
-            f"📊 Our Lifetime History:\n\n"
-            f"⏰ Together for: {memory['time_since_first']}\n"
-            f"🎂 First chat: {memory['first_chat']}\n"
-            f"💬 Total messages: {memory['total_messages']}\n"
-            f"🧠 Memory type: LIFETIME (no expiration)"
-        )
+    # Stats/memory commands
+    elif any(x in current_lower for x in ["stats", "history", "how many messages", "memory"]):
+        response = f"We've chatted {memory['total_messages']} times. What would you like to know?"
     
-    elif "stats" in current_lower or "numbers" in current_lower:
-        response = (
-            f"⚽ Your Lifetime Stats:\n\n"
-            f"🏆 Total messages: {activity['lifetime']}\n"
-            f"🔥 Last hour: {activity['last_hour']}\n"
-            f"📅 Today: {activity['last_24h']}\n"
-            f"📊 This week: {activity['last_7d']}\n"
-            f"⏰ Journey length: {memory['time_since_first']}"
-        )
+    elif any(x in current_lower for x in ["remember", "recall", "what did we talk about"]):
+        if history:
+            topics = set()
+            for conv in history:
+                msg = conv.user_message.lower()
+                if "formation" in msg:
+                    topics.add("formations")
+                elif "player" in msg or any(name in msg for name in ["messi", "ronaldo", "neymar"]):
+                    topics.add("players")
+                elif "training" in msg or "drill" in msg:
+                    topics.add("training")
+                elif "tactic" in msg or "strategy" in msg:
+                    topics.add("tactics")
+            
+            if topics:
+                response = f"Recently we've talked about {', '.join(topics)}. What would you like to dive into?"
+            else:
+                response = "We've been chatting about soccer. What would you like to discuss?"
+        else:
+            response = "We just started talking! What soccer topics interest you?"
     
     else:
-        # Get LLM response with memory context
-        llm_response = get_llm_response(current_message, history, memory)
+        # Normal conversation - get LLM response
+        llm_response = get_llm_response(
+            current_message, 
+            history, 
+            memory['user_name'],
+            memory['is_new_user']
+        )
         
         if llm_response:
             response = llm_response
         else:
-            # Fallback responses if LLM fails
-            if memory["total_messages"] > 10:
-                response = f"Welcome back {memory['user_name']}! {memory['total_messages']} messages in our lifetime archive. What soccer topics shall we explore today?"
-            elif memory["total_messages"] > 0:
-                response = f"Welcome back {memory['user_name']}! Message #{memory['total_messages'] + 1} in our lifetime memory. What would you like to chat about?"
+            if memory["is_new_user"]:
+                response = "I'm here to talk soccer! What would you like to know?"
             else:
-                response = "Hi! Ask me anything about soccer - formations, tactics, players, or matches!"
-    
+                response = "Got it. Tell me more about what you're thinking."
+
     # Send response
     await update.message.reply_text(response)
     
-    # SAVE TO LIFETIME MEMORY
+    # Save to memory
     db = get_db()
     try:
         conv = Conversation(
@@ -411,7 +359,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     
     if isinstance(context.error, Conflict):
         logger.error("Conflict error detected. This means another instance is running.")
-        # Don't crash, just log it
         return
     
     if isinstance(context.error, (NetworkError, TimedOut)):
@@ -425,7 +372,6 @@ def main():
         logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
         return
     
-    # Build application
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -433,20 +379,14 @@ def main():
         .build()
     )
     
-    # Add error handler
     application.add_error_handler(error_handler)
-    
-    # Add handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("Bot running with LIFETIME memory + LLM!")
-    logger.info(f"OpenAI: {USE_OPENAI}, Ollama: {USE_OLLAMA}")
+    logger.info("Bot running with greeting detection!")
     
-    # Check if we should use webhooks (production) or polling (development)
     if RAILWAY_STATIC_URL:
-        # Production: Use webhooks
         webhook_url = f"{RAILWAY_STATIC_URL}/webhook"
         logger.info(f"Using webhook at {webhook_url}")
         
@@ -457,7 +397,6 @@ def main():
             drop_pending_updates=True
         )
     else:
-        # Development: Use polling
         logger.info("Using polling (development mode)")
         application.run_polling(
             drop_pending_updates=True,
