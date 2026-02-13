@@ -18,7 +18,6 @@ import enum
 import asyncio
 from functools import wraps
 
-# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -82,25 +81,20 @@ engine = create_engine(get_database_url())
 SessionLocal = sessionmaker(bind=engine)
 
 def init_db():
-    """Initialize database with schema migration support"""
     db = get_db()
     try:
         inspector = inspect(engine)
-        
         if 'users' in inspector.get_table_names():
             columns = [col['name'] for col in inspector.get_columns('users')]
             if 'is_authorized' not in columns:
-                logger.info("Adding is_authorized column to users...")
                 from sqlalchemy import text
                 try:
                     db.execute(text("ALTER TABLE users ADD COLUMN is_authorized BOOLEAN DEFAULT FALSE"))
                     db.commit()
                 except:
                     db.rollback()
-        
         Base.metadata.create_all(engine)
         logger.info("Database ready!")
-        
     except Exception as e:
         logger.error(f"Database error: {e}")
         try:
@@ -115,7 +109,6 @@ def init_db():
 def get_db():
     return SessionLocal()
 
-# Environment variables
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -123,7 +116,6 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 PORT = int(os.getenv("PORT", "8080"))
 RAILWAY_STATIC_URL = os.getenv("RAILWAY_STATIC_URL", "")
 
-# LLM Configuration
 USE_OPENAI = bool(OPENAI_API_KEY)
 USE_OLLAMA = bool(OLLAMA_URL and not USE_OPENAI)
 
@@ -133,86 +125,66 @@ if USE_OPENAI:
 elif USE_OLLAMA:
     logger.info(f"Using Ollama at {OLLAMA_URL}")
 else:
-    logger.warning("No LLM configured - running in memory-only mode")
+    logger.warning("No LLM configured")
 
 def check_admin(user_id: int) -> bool:
     return str(user_id) == ADMIN_TELEGRAM_ID
 
 def is_user_authorized(telegram_id: str):
-    """Check if user is authorized"""
     db = get_db()
     try:
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
-        if user:
-            return user.is_authorized
-        return False
+        return user.is_authorized if user else False
     finally:
         db.close()
 
 def log_unauthorized_attempt(telegram_id: str, username: str, first_name: str, message: str):
-    """Log attempts by unauthorized users"""
     db = get_db()
     try:
         attempt = UnauthorizedAttempt(
             telegram_id=str(telegram_id),
             username=username or "",
             first_name=first_name or "",
-            message=message[:500]  # Limit message length
+            message=message[:500]
         )
         db.add(attempt)
         db.commit()
-        logger.warning(f"Unauthorized attempt by {first_name} (@{username}): {message[:100]}")
+        logger.warning(f"Unauthorized attempt by {first_name} (@{username})")
     except Exception as e:
-        logger.error(f"Error logging unauthorized attempt: {e}")
+        logger.error(f"Error logging: {e}")
         db.rollback()
     finally:
         db.close()
 
 def require_auth(func):
-    """Decorator to require authorization"""
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         telegram_id = str(user.id)
         
-        # Always allow admin
         if check_admin(user.id):
             return await func(update, context, *args, **kwargs)
         
-        # Check if authorized
         if not is_user_authorized(telegram_id):
-            # Log the attempt
-            log_unauthorized_attempt(
-                telegram_id, 
-                user.username, 
-                user.first_name, 
-                update.message.text if update.message else "N/A"
-            )
-            
-            # Send rejection message
+            log_unauthorized_attempt(telegram_id, user.username, user.first_name, 
+                                   update.message.text if update.message else "N/A")
             await update.message.reply_text(
                 "⛔ **ACCESS DENIED**\n\n"
-                "This is a private bot. You need a valid referral code to use it.\n\n"
-                "🔑 To enter a code, type:\n`/code YOURCODE`\n\n"
-                "🎟️ Codes are given out by the admin only.\n"
-                "⏰ Codes expire after the set time period.\n\n"
+                "Private bot. Invitation only.\n\n"
+                "🔑 `/code YOURCODE`\n\n"
                 "Contact @LearnWithLucky for access.",
                 parse_mode='Markdown'
             )
             return
-        
         return await func(update, context, *args, **kwargs)
     return wrapper
 
 def generate_referral_code(length=8):
-    """Generate a random referral code"""
     alphabet = string.ascii_uppercase + string.digits
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 def parse_duration(duration_str: str) -> timedelta:
-    """Parse duration string like '1m', '3m', '6m', '12m', '1y', '30d' into timedelta"""
     duration_str = duration_str.lower().strip()
-    
     patterns = {
         r'^(\d+)m$': lambda x: int(x) * 30,
         r'^(\d+)mo$': lambda x: int(x) * 30,
@@ -230,41 +202,36 @@ def parse_duration(duration_str: str) -> timedelta:
         r'^(\d+)hour$': lambda x: int(x) / 24,
         r'^(\d+)hours$': lambda x: int(x) / 24,
     }
-    
     for pattern, converter in patterns.items():
         match = re.match(pattern, duration_str)
         if match:
             days = converter(match.group(1))
             return timedelta(days=int(days))
-    
     return timedelta(days=1)
 
 def format_duration(td: timedelta) -> str:
-    """Format timedelta into readable string"""
     days = td.days
     if days >= 365:
         years = days // 365
         remaining_days = days % 365
         if remaining_days > 30:
             months = remaining_days // 30
-            return f"{years} year{'s' if years != 1 else ''}, {months} month{'s' if months != 1 else ''}"
-        return f"{years} year{'s' if years != 1 else ''}"
+            return f"{years}y {months}m"
+        return f"{years}y"
     elif days >= 30:
         months = days // 30
         remaining_days = days % 30
         if remaining_days > 0:
-            return f"{months} month{'s' if months != 1 else ''}, {remaining_days} days"
-        return f"{months} month{'s' if months != 1 else ''}"
+            return f"{months}m {remaining_days}d"
+        return f"{months}m"
     else:
-        return f"{days} day{'s' if days != 1 else ''}"
+        return f"{days}d"
 
 def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1):
-    """Create a new time-based referral code"""
     db = get_db()
     try:
         code = generate_referral_code()
         expires_at = datetime.utcnow() + duration
-        
         ref_code = ReferralCode(
             code=code,
             created_by=admin_id,
@@ -275,7 +242,6 @@ def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1):
         )
         db.add(ref_code)
         db.commit()
-        
         return {
             "code": code,
             "expires_at": expires_at,
@@ -283,46 +249,37 @@ def create_referral_code(admin_id: str, duration: timedelta, max_uses: int = 1):
             "duration": duration
         }
     except Exception as e:
-        logger.error(f"Error creating referral code: {e}")
+        logger.error(f"Error: {e}")
         db.rollback()
         return None
     finally:
         db.close()
 
 def validate_referral_code(code: str, user_id: str):
-    """Check if code is valid and not expired"""
     db = get_db()
     try:
         ref = db.query(ReferralCode).filter_by(code=code.upper()).first()
-        
         if not ref:
             return False, "Invalid code."
-        
         if not ref.is_active:
-            return False, "This code has been deactivated."
-        
+            return False, "Code deactivated."
         if datetime.utcnow() > ref.expires_at:
             ref.is_active = False
             db.commit()
-            return False, "This code has expired."
-        
+            return False, "Code expired."
         if ref.used_count >= ref.max_uses:
-            return False, "This code has reached its maximum uses."
-        
+            return False, "Max uses reached."
         used_by_list = ref.used_by.split(",") if ref.used_by else []
         if user_id in used_by_list:
-            return False, "You have already used this code."
-        
-        return True, "Code is valid!"
-        
+            return False, "Already used."
+        return True, "Valid!"
     except Exception as e:
-        logger.error(f"Error validating code: {e}")
-        return False, "Error validating code."
+        logger.error(f"Error: {e}")
+        return False, "Error."
     finally:
         db.close()
 
 def use_referral_code(code: str, user_id: str):
-    """Mark code as used by a specific user"""
     db = get_db()
     try:
         ref = db.query(ReferralCode).filter_by(code=code.upper()).first()
@@ -331,22 +288,19 @@ def use_referral_code(code: str, user_id: str):
             used_by_list = ref.used_by.split(",") if ref.used_by else []
             used_by_list.append(user_id)
             ref.used_by = ",".join(used_by_list)
-            
             if ref.used_count >= ref.max_uses:
                 ref.is_active = False
-            
             db.commit()
             return True
         return False
     except Exception as e:
-        logger.error(f"Error using referral code: {e}")
+        logger.error(f"Error: {e}")
         db.rollback()
         return False
     finally:
         db.close()
 
 def authorize_user(telegram_id: str):
-    """Mark user as authorized"""
     db = get_db()
     try:
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
@@ -356,14 +310,13 @@ def authorize_user(telegram_id: str):
             return True
         return False
     except Exception as e:
-        logger.error(f"Error authorizing user: {e}")
+        logger.error(f"Error: {e}")
         db.rollback()
         return False
     finally:
         db.close()
 
 def get_recent_memory(telegram_id: str, max_messages: int = 6):
-    """Fetch only recent conversations for context"""
     db = get_db()
     try:
         history = db.query(Conversation).filter(
@@ -374,27 +327,21 @@ def get_recent_memory(telegram_id: str, max_messages: int = 6):
         db.close()
 
 def get_memory_summary(telegram_id: str):
-    """Get minimal summary"""
     db = get_db()
     try:
         total_convos = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).count()
-        
         first_convo = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(Conversation.timestamp).first()
-        
         last_convo = db.query(Conversation).filter(
             Conversation.telegram_id == telegram_id
         ).order_by(desc(Conversation.timestamp)).first()
-        
         user = db.query(User).filter_by(telegram_id=telegram_id).first()
-        
         time_since_last = None
         if last_convo:
             time_since_last = datetime.utcnow() - last_convo.timestamp
-        
         return {
             "total_messages": total_convos,
             "first_chat": first_convo.timestamp if first_convo else None,
@@ -408,12 +355,9 @@ def get_memory_summary(telegram_id: str):
         db.close()
 
 def is_greeting(message: str) -> bool:
-    """Check if message is a greeting"""
-    greetings = [
-        "hi", "hello", "hey", "greetings", "good morning", 
-        "good afternoon", "good evening", "yo", "sup", "what's up",
-        "howdy", "hi there", "hello there", "hey there"
-    ]
+    greetings = ["hi", "hello", "hey", "greetings", "good morning", 
+                "good afternoon", "good evening", "yo", "sup", "what's up",
+                "howdy", "hi there", "hello there", "hey there"]
     msg_lower = message.lower().strip()
     for greeting in greetings:
         if msg_lower == greeting or msg_lower.startswith(greeting + " "):
@@ -421,15 +365,13 @@ def is_greeting(message: str) -> bool:
     return False
 
 def get_llm_response(user_message: str, conversation_history: list, user_name: str, is_new_user: bool = False) -> str:
-    """Get natural response from LLM"""
-    
     messages = []
     
-    system_prompt = """You are a knowledgeable soccer assistant having a natural conversation. 
-You remember past discussions but speak casually like a friend. 
-Don't summarize conversation history unless asked. 
-Just respond to the current question while maintaining context from previous messages.
-Be concise, friendly, and soccer-focused."""
+    # GENERAL KNOWLEDGE - not just soccer anymore
+    system_prompt = f"""You are a knowledgeable AI assistant having natural conversations. 
+You can discuss any topic: sports, science, tech, history, coding, business, advice, creative writing, analysis, etc.
+You remember past discussions with {user_name} and maintain continuity.
+Be helpful, concise, and conversational. If you're unsure, say so. Don't make things up."""
     
     messages.append({"role": "system", "content": system_prompt})
     
@@ -445,7 +387,7 @@ Be concise, friendly, and soccer-focused."""
             response = openai.ChatCompletion.create(
                 model="gpt-3.5-turbo",
                 messages=messages,
-                max_tokens=300,
+                max_tokens=400,
                 temperature=0.7
             )
             return response.choices[0].message.content
@@ -453,7 +395,7 @@ Be concise, friendly, and soccer-focused."""
         elif USE_OLLAMA:
             prompt = f"{system_prompt}\n\n"
             if conversation_history and not is_new_user:
-                prompt += "Recent conversation:\n"
+                prompt += "Recent chat:\n"
                 for conv in conversation_history[-3:]:
                     prompt += f"User: {conv.user_message}\n"
                     prompt += f"Assistant: {conv.bot_response}\n"
@@ -461,19 +403,12 @@ Be concise, friendly, and soccer-focused."""
             
             response = requests.post(
                 f"{OLLAMA_URL}/api/generate",
-                json={
-                    "model": "llama2",
-                    "prompt": prompt,
-                    "stream": False,
-                    "max_tokens": 300
-                },
+                json={"model": "llama2", "prompt": prompt, "stream": False, "max_tokens": 400},
                 timeout=30
             )
-            return response.json().get("response", "I couldn't generate a response right now.")
-        
+            return response.json().get("response", "Can't respond right now.")
         else:
             return None
-            
     except Exception as e:
         logger.error(f"LLM error: {e}")
         return None
@@ -482,27 +417,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     telegram_id = str(user.id)
     
-    # Check authorization
-    authorized = is_user_authorized(telegram_id)
-    
-    if not authorized and not check_admin(user.id):
-        # Log this attempt
-        log_unauthorized_attempt(
-            telegram_id,
-            user.username,
-            user.first_name,
-            "Started bot without code"
-        )
-        
+    if not is_user_authorized(telegram_id) and not check_admin(user.id):
+        log_unauthorized_attempt(telegram_id, user.username, user.first_name, "Started bot")
         await update.message.reply_text(
-            "👋 **Welcome to Learn With Lucky Soccer Bot**\n\n"
-            "🔒 This is a **private bot**. Access is by invitation only.\n\n"
-            "🎟️ **To join:**\n"
-            "1. Get a referral code from @LearnWithLucky\n"
-            "2. Type: `/code YOURCODE`\n\n"
-            "⏰ Codes expire after set time\n"
-            "👥 Limited uses per code\n\n"
-            "No code? Contact @LearnWithLucky for access.",
+            "🔒 **Private AI Bot**\n\n"
+            "Invitation only access.\n\n"
+            "🔑 Get code from @LearnWithLucky\n"
+            "💬 Then type: `/code YOURCODE`",
             parse_mode='Markdown'
         )
         return
@@ -510,55 +431,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     memory = get_memory_summary(telegram_id)
     
     if memory["is_new_user"]:
-        welcome = "Hey! I'm your soccer buddy. Ask me anything about the beautiful game! ⚽"
+        welcome = "Hey! I'm your AI assistant. I know a bit about everything and I remember our conversations. What's on your mind?"
     else:
         if memory["time_since_last"] and memory["time_since_last"].days > 7:
-            welcome = f"Hey {memory['user_name']}! Long time no see. What's on your mind about soccer?"
+            welcome = f"Hey {memory['user_name']}! Been a while. What are we talking about today?"
         else:
             welcome = f"Hey {memory['user_name']}! What's up?"
     
     await update.message.reply_text(welcome)
 
 async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User enters referral code - NO auth required"""
     user = update.effective_user
     telegram_id = str(user.id)
     
     if not context.args:
-        await update.message.reply_text(
-            "🔑 **Enter Referral Code**\n\n"
-            "Usage: `/code YOURCODE`\n\n"
-            "Example: `/code X7K9M2P4`",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("🔑 `/code YOURCODE`", parse_mode='Markdown')
         return
     
     code = context.args[0].upper()
     user_id_str = str(telegram_id)
     
-    # Check if already authorized
     if is_user_authorized(telegram_id):
-        await update.message.reply_text("✅ You're already authorized! Enjoy the bot! ⚽")
+        await update.message.reply_text("✅ Already have access!")
         return
     
-    # Validate code
     is_valid, message = validate_referral_code(code, user_id_str)
     
     if not is_valid:
-        # Log failed attempt
-        log_unauthorized_attempt(
-            telegram_id,
-            user.username,
-            user.first_name,
-            f"Failed code attempt: {code}"
-        )
-        
-        await update.message.reply_text(f"❌ **{message}**\n\nTry again or contact @LearnWithLucky for a valid code.", parse_mode='Markdown')
+        log_unauthorized_attempt(telegram_id, user.username, user.first_name, f"Bad code: {code}")
+        await update.message.reply_text(f"❌ {message}")
         return
     
-    # Use the code
     if use_referral_code(code, user_id_str):
-        # Create or update user
         db = get_db()
         try:
             user_db = db.query(User).filter_by(telegram_id=telegram_id).first()
@@ -573,51 +477,43 @@ async def enter_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db.add(user_db)
             else:
                 user_db.is_authorized = True
-            
             db.commit()
             
             await update.message.reply_text(
                 "✅ **Access Granted!**\n\n"
-                "Welcome to the Soccer Bot! 🎉⚽\n\n"
-                "I remember every conversation we have. Ask me anything about:\n"
-                "• Formations & tactics\n"
-                "• Players & teams\n"
-                "• Training & drills\n"
-                "• Match analysis\n\n"
+                "I'm your AI assistant with memory. Ask me anything:\n"
+                "• Sports, science, tech, history\n"
+                "• Advice, analysis, creative writing\n"
+                "• Coding, business, random questions\n\n"
                 "What would you like to talk about?"
             )
-            
         except Exception as e:
-            logger.error(f"Error creating user: {e}")
+            logger.error(f"Error: {e}")
             db.rollback()
-            await update.message.reply_text("❌ Error processing code. Please try again.")
+            await update.message.reply_text("❌ Error. Try again.")
         finally:
             db.close()
     else:
-        await update.message.reply_text("❌ Error processing code. Please try again.")
+        await update.message.reply_text("❌ Error. Try again.")
 
 @require_auth
 async def generate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to generate referral code - REQUIRES AUTH"""
     user = update.effective_user
-    
     if not check_admin(user.id):
-        await update.message.reply_text("⛔ This command is only for admins.")
+        await update.message.reply_text("⛔ Admin only.")
         return
     
-    # Parse arguments: /gencode [duration] [uses]
     duration_str = "24h"
     max_uses = 1
     
     if context.args:
         first_arg = context.args[0]
-        
         if any(c.isalpha() for c in first_arg):
             duration_str = first_arg
             if len(context.args) > 1:
                 try:
                     max_uses = int(context.args[1])
-                except ValueError:
+                except:
                     pass
         else:
             try:
@@ -625,141 +521,91 @@ async def generate_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 duration_str = f"{hours}h"
                 if len(context.args) > 1:
                     max_uses = int(context.args[1])
-            except ValueError:
-                await update.message.reply_text(
-                    "📋 **Usage:**\n"
-                    "`/gencode [duration] [uses]`\n\n"
-                    "**Examples:**\n"
-                    "`/gencode 1m` (1 month, 1 use)\n"
-                    "`/gencode 3m 5` (3 months, 5 uses)\n"
-                    "`/gencode 6m 10` (6 months, 10 uses)\n"
-                    "`/gencode 12m` (12 months)\n"
-                    "`/gencode 1y` (1 year)",
-                    parse_mode='Markdown'
-                )
+            except:
+                await update.message.reply_text("Usage: `/gencode 3m 5`", parse_mode='Markdown')
                 return
     
     duration = parse_duration(duration_str)
     result = create_referral_code(str(user.id), duration, max_uses)
     
     if result:
-        expires_str = result['expires_at'].strftime("%B %d, %Y")
+        expires_str = result['expires_at'].strftime("%b %d, %Y")
         duration_readable = format_duration(result['duration'])
         
         await update.message.reply_text(
-            f"🎟️ **Referral Code Generated**\n\n"
-            f"Code: `{result['code']}`\n"
+            f"🎟️ **Code Generated**\n\n"
+            f"`{result['code']}`\n"
             f"Duration: {duration_readable}\n"
             f"Expires: {expires_str}\n"
-            f"Max uses: {result['max_uses']}\n\n"
-            f"Share this code with friends!",
+            f"Uses: {result['max_uses']}",
             parse_mode='Markdown'
         )
     else:
-        await update.message.reply_text("❌ Error generating code. Please try again.")
+        await update.message.reply_text("❌ Error.")
 
 @require_auth
 async def list_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to list active codes - REQUIRES AUTH"""
     user = update.effective_user
-    
     if not check_admin(user.id):
-        await update.message.reply_text("⛔ This command is only for admins.")
+        await update.message.reply_text("⛔ Admin only.")
         return
     
     db = get_db()
     try:
         codes = db.query(ReferralCode).filter_by(is_active=True).all()
-        
         if not codes:
-            await update.message.reply_text("📭 No active referral codes.")
+            await update.message.reply_text("No active codes.")
             return
         
-        message = "🎟️ **Active Referral Codes:**\n\n"
+        msg = "🎟️ **Active Codes:**\n\n"
         for code in codes:
             expires_in = code.expires_at - datetime.utcnow()
-            hours_left = int(expires_in.total_seconds() / 3600)
-            days_left = hours_left // 24
-            
+            days_left = expires_in.days
             if days_left > 30:
-                months_left = days_left // 30
-                time_left = f"{months_left}mo"
+                time_left = f"{days_left//30}m"
             elif days_left > 0:
                 time_left = f"{days_left}d"
             else:
-                time_left = f"{hours_left}h"
+                time_left = f"{expires_in.seconds//3600}h"
             
-            status = "⏰" if hours_left < 24 else "✅"
-            
-            message += (
-                f"{status} `{code.code}` | "
-                f"Uses: {code.used_count}/{code.max_uses} | "
-                f"Expires: {time_left}\n"
-            )
+            msg += f"`{code.code}` | {code.used_count}/{code.max_uses} | {time_left} left\n"
         
-        await update.message.reply_text(message, parse_mode='Markdown')
-        
+        await update.message.reply_text(msg, parse_mode='Markdown')
     except Exception as e:
-        logger.error(f"Error listing codes: {e}")
-        await update.message.reply_text("❌ Error retrieving codes.")
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Error.")
     finally:
         db.close()
 
 @require_auth
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages - REQUIRES AUTH"""
     user = update.effective_user
     telegram_id = str(user.id)
     current_message = update.message.text
     
     history = get_recent_memory(telegram_id, max_messages=6)
     memory = get_memory_summary(telegram_id)
-    
     current_lower = current_message.lower()
     
     if is_greeting(current_message):
         response = "Hi, how may I assist you?"
     
-    elif any(x in current_lower for x in ["stats", "history", "how many messages", "memory"]):
-        response = f"We've chatted {memory['total_messages']} times. What would you like to know?"
+    elif any(x in current_lower for x in ["stats", "history", "memory"]):
+        response = f"We've chatted {memory['total_messages']} times. What's up?"
     
-    elif any(x in current_lower for x in ["remember", "recall", "what did we talk about"]):
+    elif any(x in current_lower for x in ["remember", "recall"]):
         if history:
-            topics = set()
-            for conv in history:
-                msg = conv.user_message.lower()
-                if "formation" in msg:
-                    topics.add("formations")
-                elif "player" in msg or any(name in msg for name in ["messi", "ronaldo", "neymar"]):
-                    topics.add("players")
-                elif "training" in msg or "drill" in msg:
-                    topics.add("training")
-                elif "tactic" in msg or "strategy" in msg:
-                    topics.add("tactics")
-            
-            if topics:
-                response = f"Recently we've talked about {', '.join(topics)}. What would you like to dive into?"
-            else:
-                response = "We've been chatting about soccer. What would you like to discuss?"
+            response = "We've been talking about various things. What specifically?"
         else:
-            response = "We just started talking! What soccer topics interest you?"
+            response = "Just getting started! What would you like to discuss?"
     
     else:
-        llm_response = get_llm_response(
-            current_message, 
-            history, 
-            memory['user_name'],
-            memory['is_new_user']
-        )
-        
+        llm_response = get_llm_response(current_message, history, memory['user_name'], memory['is_new_user'])
         if llm_response:
             response = llm_response
         else:
-            if memory["is_new_user"]:
-                response = "I'm here to talk soccer! What would you like to know?"
-            else:
-                response = "Got it. Tell me more about what you're thinking."
-
+            response = "I'm here to help. What would you like to know?" if memory["is_new_user"] else "Tell me more."
+    
     await update.message.reply_text(response)
     
     db = get_db()
@@ -786,21 +632,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_db.message_count = memory['total_messages'] + 1
         user_db.last_active = datetime.utcnow()
         db.commit()
-        
     except Exception as e:
-        logger.error(f"Error saving to database: {e}")
+        logger.error(f"Error: {e}")
         db.rollback()
     finally:
         db.close()
 
 @require_auth
 async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command to delete all user data - REQUIRES AUTH"""
     user = update.effective_user
     telegram_id = str(user.id)
-    
     if not check_admin(user.id):
-        await update.message.reply_text("⛔ This command is only for admins.")
+        await update.message.reply_text("⛔ Admin only.")
         return
     
     db = get_db()
@@ -808,40 +651,30 @@ async def delete_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.query(Conversation).filter_by(telegram_id=telegram_id).delete()
         db.query(User).filter_by(telegram_id=telegram_id).delete()
         db.commit()
-        await update.message.reply_text("🗑️ All your data has been deleted. Start fresh!")
+        await update.message.reply_text("🗑️ Data deleted.")
     except Exception as e:
-        logger.error(f"Error deleting data: {e}")
+        logger.error(f"Error: {e}")
         db.rollback()
-        await update.message.reply_text("❌ Error deleting data.")
+        await update.message.reply_text("❌ Error.")
     finally:
         db.close()
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors gracefully"""
-    logger.error(f"Exception while handling an update: {context.error}")
-    
+    logger.error(f"Exception: {context.error}")
     if isinstance(context.error, Conflict):
-        logger.error("Conflict error detected. This means another instance is running.")
+        logger.error("Conflict - multiple instances")
         return
-    
     if isinstance(context.error, (NetworkError, TimedOut)):
-        logger.warning("Network error. Will retry automatically...")
+        logger.warning("Network error")
         return
 
 def main():
     init_db()
-    
     if not TELEGRAM_TOKEN:
-        logger.error("ERROR: TELEGRAM_BOT_TOKEN not set!")
+        logger.error("No TELEGRAM_BOT_TOKEN!")
         return
     
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .concurrent_updates(False)
-        .build()
-    )
-    
+    application = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(False).build()
     application.add_error_handler(error_handler)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("code", enter_code))
@@ -850,26 +683,17 @@ def main():
     application.add_handler(CommandHandler("delete_my_data", delete_my_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    logger.info("🔒 Bot running with STRICT authorization!")
-    logger.info("Only users with valid codes can access.")
+    logger.info("🚀 General knowledge AI bot running!")
     
     if RAILWAY_STATIC_URL:
-        webhook_url = f"{RAILWAY_STATIC_URL}/webhook"
-        logger.info(f"Using webhook at {webhook_url}")
-        
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            webhook_url=webhook_url,
+            webhook_url=f"{RAILWAY_STATIC_URL}/webhook",
             drop_pending_updates=True
         )
     else:
-        logger.info("Using polling (development mode)")
-        application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False
-        )
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES, close_loop=False)
 
 if __name__ == "__main__":
     main()
